@@ -9,41 +9,41 @@
 //! Both follow the same snapshot-plus-deltas rule, implemented once in
 //! [`synced`]. Everything that happens is published as an [`Event`], and
 //! every book is published again in full once per snapshot interval.
+//!
+//! [`Kalshi`] owns the symbol list and the REST fetch. Each WebSocket, with
+//! the books built from it, is a [`connection::Connection`].
 
 mod book;
+mod connection;
 mod symbols;
 mod synced;
+mod wire;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use futures_util::future::BoxFuture;
-use futures_util::{SinkExt, StreamExt};
+use reqwest::StatusCode;
 use rsa::RsaPrivateKey;
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::DecodePrivateKey;
 use rsa::pss::BlindedSigningKey;
 use rsa::signature::{RandomizedSigner, SignatureEncoding};
 use serde::Deserialize;
-use serde_json::{Value, json};
 use sha2::Sha256;
-use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 pub use book::Level;
 pub use symbols::SymbolChange;
 
 use crate::Side;
-use book::{Book, BookChange, BookDelta, BookSide, BookSnapshot, parse_fp, parse_price};
-use symbols::{LifecycleEvent, OpenSet, SymbolList};
+use connection::{Connection, Heard};
+use symbols::{OpenSet, SymbolList};
 use synced::Synced;
 
 const PROD_REST: &str = "https://external-api.kalshi.com/trade-api/v2";
@@ -51,20 +51,12 @@ const PROD_WS: &str = "wss://external-api-ws.kalshi.com/trade-api/ws/v2";
 const DEMO_REST: &str = "https://external-api.demo.kalshi.co/trade-api/v2";
 const DEMO_WS: &str = "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2";
 
-const LIFECYCLE_CHANNEL: &str = "market_lifecycle_v2";
-const BOOK_CHANNEL: &str = "orderbook_delta";
+/// The longest pause between two attempts at a failing REST fetch.
+const MAX_FETCH_PAUSE: Duration = Duration::from_secs(30);
+/// The longest pause before asking again for a rate-limited REST page.
+const MAX_RATE_LIMIT_PAUSE: Duration = Duration::from_secs(5);
 
-/// Symbols per subscribe / update command.
-const COMMAND_BATCH: usize = 500;
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
-/// The shortest time between two re-fetches of every book. Several sequence
-/// gaps close together are answered with one re-fetch, not one each.
-const REFETCH_COOLDOWN: Duration = Duration::from_secs(5);
-/// How long a closing handshake may take before the socket is just dropped.
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
-
-type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
-type Fetch = BoxFuture<'static, anyhow::Result<OpenSet>>;
+type Fetch = BoxFuture<'static, OpenSet>;
 
 /// Something that happened to the symbol list or to a symbol's book.
 #[derive(Debug, Clone, PartialEq)]
@@ -156,31 +148,23 @@ pub struct Kalshi {
     config: KalshiConfig,
     auth: Option<Arc<Auth>>,
     http: reqwest::Client,
+    /// `GET` this for the open markets.
+    markets_url: reqwest::Url,
     events: Sender<Event>,
 
     symbols: Synced<SymbolList>,
-    books: HashMap<String, Synced<Book>>,
+    /// The symbol list may have missed a change and must be re-fetched.
+    symbols_stale: bool,
+    /// The REST fetch in progress, if any. Only one runs at a time.
+    fetch: Option<Fetch>,
     /// When every book is next published in full.
     next_snapshot: tokio::time::Instant,
 
-    // State of the current WebSocket connection; reset on every reconnect.
-    /// Symbols Kalshi has been asked to send books for.
-    subscribed: HashSet<String>,
-    /// Subscription id of the orderbook channel, once Kalshi has told us.
-    book_sid: Option<u64>,
-    /// Book commands that need `book_sid` and are waiting for it.
-    deferred: Vec<(&'static str, Vec<String>)>,
-    /// Last sequence number seen on each subscription.
-    last_seq: HashMap<u64, u64>,
-    /// When the books a sequence gap invalidated will be asked for again.
-    refetch_at: Option<tokio::time::Instant>,
-    /// When that was last done.
-    last_refetch: Option<tokio::time::Instant>,
+    /// For now exactly one, which supplies both the lifecycle messages and
+    /// the books that are published.
+    connections: Vec<Connection>,
     /// Message types we do not handle and have already logged once.
     unhandled: HashSet<String>,
-    /// A lifecycle message was missed, so the list must be re-fetched.
-    symbols_stale: bool,
-    next_command_id: u64,
 }
 
 impl Kalshi {
@@ -201,26 +185,24 @@ impl Kalshi {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()?;
+        let markets_url = reqwest::Url::parse(&format!("{}/markets", config.rest_url))
+            .context("the REST URL is not a valid URL")?;
         let (events, events_rx) = unbounded();
         let symbols = Synced::new(SymbolList::new(config.series_ticker.clone()));
         let next_snapshot = tokio::time::Instant::now() + config.snapshot_interval;
+        let connections = vec![Connection::new(config.ws_url.clone(), auth.clone())];
         let kalshi = Self {
             config,
             auth,
             http,
+            markets_url,
             events,
             symbols,
-            books: HashMap::new(),
-            next_snapshot,
-            subscribed: HashSet::new(),
-            book_sid: None,
-            deferred: Vec::new(),
-            last_seq: HashMap::new(),
-            refetch_at: None,
-            last_refetch: None,
-            unhandled: HashSet::new(),
             symbols_stale: false,
-            next_command_id: 0,
+            fetch: None,
+            next_snapshot,
+            connections,
+            unhandled: HashSet::new(),
         };
         Ok((kalshi, events_rx))
     }
@@ -231,105 +213,100 @@ impl Kalshi {
     }
 
     /// Connects and stays in sync until `shutdown` completes, then closes the
-    /// WebSocket and returns. Reconnects with backoff on any error.
+    /// WebSocket and returns. A failed connection is reopened after a pause.
     pub async fn run(&mut self, shutdown: impl Future<Output = ()>) {
         tokio::pin!(shutdown);
-        let mut backoff = Duration::from_secs(1);
-        loop {
-            let started = Instant::now();
-            let connected = tokio::select! {
-                _ = &mut shutdown => return,
-                connected = self.connect() => connected,
-            };
-            let error = match connected {
-                Ok(mut ws) => tokio::select! {
-                    _ = &mut shutdown => return close(ws).await,
-                    Err(error) = self.session(&mut ws) => error,
-                },
-                Err(error) => error,
-            };
-            eprintln!("kalshi: session ended: {error:#}");
-            if started.elapsed() > Duration::from_secs(60) {
-                backoff = Duration::from_secs(1);
-            }
-            let jitter = Duration::from_millis(rand::random::<u64>() % 1000);
-            tokio::select! {
-                _ = &mut shutdown => return,
-                _ = tokio::time::sleep(backoff + jitter) => {}
-            }
-            backoff = (backoff * 2).min(MAX_BACKOFF);
-        }
-    }
-
-    // ---- connection -------------------------------------------------------
-
-    /// One WebSocket connection's lifetime. Only ever returns an error.
-    async fn session(&mut self, ws: &mut Ws) -> Result<std::convert::Infallible, anyhow::Error> {
-        // A new connection has no subscriptions and nothing is in sync.
-        self.subscribed.clear();
-        self.book_sid = None;
-        self.deferred.clear();
-        self.last_seq.clear();
-        self.refetch_at = None;
-        for book in self.books.values_mut() {
-            *book = Synced::new(Book::default());
-        }
-
-        // Listen before fetching: lifecycle events that arrive while REST is
-        // paging are held by `self.symbols` and replayed after the load.
-        self.command(ws, "subscribe", json!({ "channels": [LIFECYCLE_CHANNEL] }))
-            .await?;
-        let existing = self.books.keys().cloned().collect();
-        self.subscribe_books(ws, existing).await?;
-        let mut fetch = Some(self.start_fetch());
-
         let mut reconcile = tokio::time::interval(self.config.reconcile_interval);
         reconcile.tick().await; // the first tick fires immediately
         loop {
-            let now = Utc::now().timestamp();
-            let until_close = self.symbols.state().until_next_close(now);
-            let refetch_at = self.refetch_at;
+            let until_close = self.symbols.state().until_next_close(Utc::now().timestamp());
+            let next_snapshot = self.next_snapshot;
+            let fetching = self.fetch.is_some();
+            let (connections, fetch) = (&mut self.connections, &mut self.fetch);
             tokio::select! {
-                message = ws.next() => {
-                    let message = message.context("websocket closed")??;
-                    self.on_message(ws, message).await?;
-                }
-                open = async { fetch.as_mut().expect("guarded").await }, if fetch.is_some() => {
-                    fetch = None;
+                _ = &mut shutdown => break,
+                (index, heard) = next_heard(connections) => self.on_heard(index, heard),
+                open = async { fetch.as_mut().expect("guarded").await }, if fetching => {
+                    self.fetch = None;
                     let mut changes = Vec::new();
-                    self.symbols.on_snapshot(open?, &mut changes)?;
-                    self.on_symbol_changes(ws, changes).await?;
+                    match self.symbols.on_snapshot(open, &mut changes) {
+                        Ok(()) => self.on_symbol_changes(changes),
+                        Err(error) => self.distrust_symbols(error),
+                    }
                 }
                 _ = tokio::time::sleep(until_close) => {
                     let mut changes = Vec::new();
                     self.symbols.state_mut().expire(Utc::now().timestamp(), &mut changes);
-                    self.on_symbol_changes(ws, changes).await?;
+                    self.on_symbol_changes(changes);
                 }
                 _ = reconcile.tick() => self.symbols_stale = true,
-                _ = tokio::time::sleep_until(self.next_snapshot) => self.publish_snapshots(),
-                _ = async { tokio::time::sleep_until(refetch_at.expect("guarded")).await },
-                    if refetch_at.is_some() =>
-                {
-                    let stale = self.take_stale_books();
-                    self.update_books(ws, "get_snapshot", stale).await?;
+                _ = tokio::time::sleep_until(next_snapshot) => self.publish_snapshots(),
+            }
+            // Listen before fetching: lifecycle messages that arrive while
+            // REST is paging are held by `self.symbols` and replayed after
+            // the load. So a fetch only starts while someone is listening.
+            if self.symbols_stale && self.fetch.is_none() && self.connections[0].is_open() {
+                self.fetch = Some(self.start_fetch());
+            }
+        }
+        for connection in &mut self.connections {
+            connection.close().await;
+        }
+    }
+
+    // ---- reacting ---------------------------------------------------------
+
+    fn on_heard(&mut self, index: usize, heard: Heard) {
+        match heard {
+            Heard::Opened => {
+                // A new socket has no subscriptions. Follow every current
+                // symbol, and re-fetch the list: changes made while nothing
+                // was listening were missed.
+                let following: Vec<SymbolChange> =
+                    self.symbols().into_iter().map(SymbolChange::Added).collect();
+                let connection = &mut self.connections[index];
+                connection.subscribe_lifecycle();
+                connection.on_symbol_changes(&following);
+                self.symbols_stale = true;
+            }
+            Heard::Lost(error) => {
+                eprintln!("kalshi: session ended: {error:#}");
+                // Nothing is listening, so a fetch in progress could not be
+                // trusted. A new one starts when the socket is open again.
+                self.fetch = None;
+                self.symbols_stale = true;
+            }
+            Heard::Missed => self.symbols_stale = true,
+            Heard::Lifecycle(event) => {
+                let mut changes = Vec::new();
+                match self.symbols.on_delta(event, &mut changes) {
+                    Ok(()) => self.on_symbol_changes(changes),
+                    Err(error) => self.distrust_symbols(error),
                 }
             }
-            if self.symbols_stale && fetch.is_none() {
-                fetch = Some(self.start_fetch());
+            Heard::Book(event) => self.publish(event),
+            Heard::Unhandled { kind, raw } => {
+                if self.unhandled.insert(kind.clone()) {
+                    eprintln!("kalshi: not handling `{kind}` messages; the first one: {raw}");
+                }
             }
         }
     }
 
-    async fn connect(&self) -> anyhow::Result<Ws> {
-        let mut request = self.config.ws_url.as_str().into_client_request()?;
-        let path = request.uri().path().to_owned();
-        for (name, value) in auth_headers(&self.auth, "GET", &path)? {
-            request.headers_mut().insert(name, value.parse()?);
+    /// Passes changes to the symbol list on to every connection, and
+    /// publishes them.
+    fn on_symbol_changes(&mut self, changes: Vec<SymbolChange>) {
+        for connection in &mut self.connections {
+            connection.on_symbol_changes(&changes);
         }
-        let (ws, _) = tokio_tungstenite::connect_async(request)
-            .await
-            .context("websocket connect")?;
-        Ok(ws)
+        for change in changes {
+            self.publish(Event::Symbol(change));
+        }
+    }
+
+    fn distrust_symbols(&mut self, error: anyhow::Error) {
+        eprintln!("kalshi: the symbol list is out of sync: {error:#}; fetching it again");
+        self.symbols_stale = true;
     }
 
     /// Starts fetching the open set from REST. Until it is loaded the symbol
@@ -340,252 +317,9 @@ impl Kalshi {
         Box::pin(fetch_open_markets(
             self.http.clone(),
             self.auth.clone(),
-            format!("{}/markets", self.config.rest_url),
+            self.markets_url.clone(),
             self.config.series_ticker.clone(),
         ))
-    }
-
-    async fn command(&mut self, ws: &mut Ws, cmd: &str, params: Value) -> anyhow::Result<()> {
-        self.next_command_id += 1;
-        let command = json!({ "id": self.next_command_id, "cmd": cmd, "params": params });
-        ws.send(Message::Text(command.to_string().into())).await?;
-        Ok(())
-    }
-
-    /// Asks Kalshi for the books of `symbols`. A repeated subscribe adds
-    /// markets to the connection's one orderbook subscription, and each new
-    /// market gets a snapshot.
-    async fn subscribe_books(&mut self, ws: &mut Ws, symbols: BTreeSet<String>) -> anyhow::Result<()> {
-        let symbols: Vec<String> = symbols.into_iter().collect();
-        for batch in symbols.chunks(COMMAND_BATCH) {
-            let params = json!({
-                "channels": [BOOK_CHANNEL],
-                "market_tickers": batch,
-                // Keep NO levels in NO prices; `Book` converts them to asks.
-                "use_yes_price": false,
-            });
-            self.command(ws, "subscribe", params).await?;
-        }
-        self.subscribed.extend(symbols);
-        Ok(())
-    }
-
-    /// Sends `delete_markets` or `get_snapshot` for `symbols`, or defers it
-    /// until the orderbook subscription id is known.
-    async fn update_books(
-        &mut self,
-        ws: &mut Ws,
-        action: &'static str,
-        symbols: Vec<String>,
-    ) -> anyhow::Result<()> {
-        if symbols.is_empty() {
-            return Ok(());
-        }
-        let Some(sid) = self.book_sid else {
-            self.deferred.push((action, symbols));
-            return Ok(());
-        };
-        for batch in symbols.chunks(COMMAND_BATCH) {
-            let params = json!({ "sids": [sid], "market_tickers": batch, "action": action });
-            self.command(ws, "update_subscription", params).await?;
-        }
-        Ok(())
-    }
-
-    // ---- reacting ---------------------------------------------------------
-
-    async fn on_message(&mut self, ws: &mut Ws, message: Message) -> anyhow::Result<()> {
-        let received_at = Utc::now();
-        let Some(frame) = parse_message(message)? else {
-            return Ok(());
-        };
-        if let (true, Some(sid)) = (frame.body.is_book(), frame.sid) {
-            self.learn_book_sid(ws, sid).await?;
-        }
-        // Every message on a subscription is numbered, whatever its type, so
-        // every one is checked here before its type is looked at.
-        if let (Some(sid), Some(seq)) = (frame.sid, frame.seq) {
-            let last = self.last_seq.get(&sid).copied();
-            if let (true, Some(last)) = (self.is_gap(sid, seq), last) {
-                eprintln!(
-                    "kalshi: sequence gap on subscription {sid}: expected {}, got {seq} ({})",
-                    last + 1,
-                    frame.body.kind(),
-                );
-                if self.book_sid == Some(sid) {
-                    self.on_book_gap();
-                } else {
-                    self.symbols_stale = true;
-                }
-            }
-        }
-        let exchange_timestamp = frame
-            .timestamp_ms
-            .and_then(DateTime::from_timestamp_millis)
-            .unwrap_or(received_at);
-
-        match frame.body {
-            Body::Lifecycle(event) => {
-                let mut changes = Vec::new();
-                self.symbols.on_delta(event, &mut changes)?;
-                self.on_symbol_changes(ws, changes).await?;
-            }
-            Body::Subscribed { channel, sid } => {
-                eprintln!("kalshi: subscribed to {channel} as subscription {sid}");
-                if channel == BOOK_CHANNEL {
-                    self.learn_book_sid(ws, sid).await?;
-                }
-            }
-            // Their sequence numbers were counted above; nothing else to do.
-            Body::Ok | Body::EventLifecycle => {}
-            Body::Other { kind, raw } => {
-                if self.unhandled.insert(kind.clone()) {
-                    eprintln!("kalshi: not handling `{kind}` messages; the first one: {raw}");
-                }
-            }
-            Body::BookSnapshot { symbol, snapshot } => {
-                if let Some(book) = self.books.get_mut(&symbol) {
-                    let mut changes = Vec::new();
-                    book.on_snapshot(snapshot, &mut changes)?;
-                    self.publish_book(&symbol, changes, received_at, exchange_timestamp);
-                }
-            }
-            Body::BookDelta { symbol, delta } => {
-                // A late delta for a symbol we have dropped is not an error.
-                if let Some(book) = self.books.get_mut(&symbol) {
-                    let mut changes = Vec::new();
-                    let applied = book.on_delta(delta, &mut changes);
-                    self.publish_book(&symbol, changes, received_at, exchange_timestamp);
-                    if let Err(error) = applied {
-                        eprintln!("kalshi: {symbol}: {error:#}; requesting a snapshot");
-                        self.update_books(ws, "get_snapshot", vec![symbol]).await?;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// True if a message was missed on subscription `sid`.
-    fn is_gap(&mut self, sid: u64, seq: u64) -> bool {
-        match self.last_seq.insert(sid, seq) {
-            Some(last) => seq != last + 1,
-            None => false,
-        }
-    }
-
-    /// A message was missed on the orderbook subscription. Its sequence is
-    /// shared by all symbols, so no book can be trusted: every one goes back
-    /// to waiting for a snapshot, and a re-fetch is scheduled. The re-fetch
-    /// is immediate unless one was sent within [`REFETCH_COOLDOWN`].
-    fn on_book_gap(&mut self) {
-        for book in self.books.values_mut() {
-            book.invalidate();
-        }
-        let now = tokio::time::Instant::now();
-        let earliest = self.last_refetch.map_or(now, |last| last + REFETCH_COOLDOWN);
-        self.refetch_at.get_or_insert(earliest.max(now));
-    }
-
-    /// The symbols whose books need a new snapshot, sorted. A book that
-    /// loaded a snapshot after the last gap is already correct and is left
-    /// alone.
-    fn take_stale_books(&mut self) -> Vec<String> {
-        self.refetch_at = None;
-        self.last_refetch = Some(tokio::time::Instant::now());
-        let mut stale: Vec<String> = self
-            .books
-            .iter()
-            .filter(|(_, book)| !book.is_live())
-            .map(|(symbol, _)| symbol.clone())
-            .collect();
-        stale.sort();
-        eprintln!("kalshi: re-fetching {} books after a sequence gap", stale.len());
-        stale
-    }
-
-    async fn learn_book_sid(&mut self, ws: &mut Ws, sid: u64) -> anyhow::Result<()> {
-        if self.book_sid.is_none() {
-            self.book_sid = Some(sid);
-            for (action, symbols) in std::mem::take(&mut self.deferred) {
-                self.update_books(ws, action, symbols).await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Creates and drops books to match the symbol list, tells Kalshi, and
-    /// publishes the changes.
-    async fn on_symbol_changes(
-        &mut self,
-        ws: &mut Ws,
-        changes: Vec<SymbolChange>,
-    ) -> anyhow::Result<()> {
-        let mut subscribe = BTreeSet::new();
-        let mut unsubscribe = BTreeSet::new();
-        let mut refresh = BTreeSet::new();
-        for change in changes {
-            match &change {
-                SymbolChange::Added(symbol) => {
-                    self.books.insert(symbol.clone(), Synced::new(Book::default()));
-                    if self.subscribed.contains(symbol) {
-                        // Removed and re-added before we unsubscribed: Kalshi
-                        // will not resend a snapshot unless asked.
-                        unsubscribe.remove(symbol);
-                        refresh.insert(symbol.clone());
-                    } else {
-                        subscribe.insert(symbol.clone());
-                    }
-                }
-                SymbolChange::Removed(symbol) => {
-                    self.books.remove(symbol);
-                    refresh.remove(symbol);
-                    if !subscribe.remove(symbol) && self.subscribed.contains(symbol) {
-                        unsubscribe.insert(symbol.clone());
-                    }
-                }
-            }
-            self.publish(Event::Symbol(change));
-        }
-        self.subscribe_books(ws, subscribe).await?;
-        for symbol in &unsubscribe {
-            self.subscribed.remove(symbol);
-        }
-        self.update_books(ws, "delete_markets", unsubscribe.into_iter().collect())
-            .await?;
-        self.update_books(ws, "get_snapshot", refresh.into_iter().collect())
-            .await
-    }
-
-    fn publish_book(
-        &self,
-        symbol: &str,
-        changes: Vec<BookChange>,
-        received_at: DateTime<Utc>,
-        exchange_timestamp: DateTime<Utc>,
-    ) {
-        let Some(book) = self.books.get(symbol) else {
-            return;
-        };
-        for change in changes {
-            self.publish(match change {
-                BookChange::Replaced => Event::Snapshot {
-                    symbol: symbol.to_owned(),
-                    bids: book.state().bids(),
-                    asks: book.state().asks(),
-                    received_at,
-                    exchange_timestamp,
-                },
-                BookChange::Level { side, price_level, quantity } => Event::Level {
-                    symbol: symbol.to_owned(),
-                    side,
-                    price_level,
-                    quantity,
-                    received_at,
-                    exchange_timestamp,
-                },
-            });
-        }
     }
 
     /// Publishes every book that is in sync, in full, in symbol order. A
@@ -593,8 +327,11 @@ impl Kalshi {
     /// trustworthy to say about it yet.
     fn publish_snapshots(&mut self) {
         let received_at = Utc::now();
-        let mut live: Vec<(&String, &Synced<Book>)> =
-            self.books.iter().filter(|(_, book)| book.is_live()).collect();
+        let mut live: Vec<(&String, &Synced<book::Book>)> = self.connections[0]
+            .books
+            .iter()
+            .filter(|(_, book)| book.is_live())
+            .collect();
         live.sort_by_key(|(symbol, _)| *symbol);
         for (symbol, book) in live {
             let book = book.state();
@@ -622,174 +359,11 @@ impl Kalshi {
     }
 }
 
-/// Closes the WebSocket politely: sends a close frame and waits, briefly,
-/// for Kalshi to acknowledge it.
-async fn close(mut ws: Ws) {
-    let handshake = async {
-        if ws.close(None).await.is_ok() {
-            // Anything still in flight is read and discarded until Kalshi's
-            // own close frame (or the end of the stream) arrives.
-            while let Some(Ok(message)) = ws.next().await {
-                if message.is_close() {
-                    break;
-                }
-            }
-        }
-    };
-    if tokio::time::timeout(CLOSE_TIMEOUT, handshake).await.is_err() {
-        eprintln!("kalshi: no close acknowledgement; dropping the connection");
-    }
-}
-
-// ---- wire formats ---------------------------------------------------------
-
-/// One parsed WebSocket message.
-struct Frame {
-    sid: Option<u64>,
-    seq: Option<u64>,
-    /// Kalshi's time for the message, Unix milliseconds.
-    timestamp_ms: Option<i64>,
-    body: Body,
-}
-
-enum Body {
-    Lifecycle(LifecycleEvent),
-    Subscribed { channel: String, sid: u64 },
-    BookSnapshot { symbol: String, snapshot: BookSnapshot },
-    BookDelta { symbol: String, delta: BookDelta },
-    /// The acknowledgement of a command on an existing subscription.
-    Ok,
-    /// A new event (a group of markets) was announced on the lifecycle
-    /// subscription. Its markets get lifecycle messages of their own, so
-    /// this needs no action.
-    EventLifecycle,
-    /// A message type we do not act on; `raw` is its (shortened) text.
-    Other { kind: String, raw: String },
-}
-
-impl Body {
-    fn kind(&self) -> &str {
-        match self {
-            Body::Lifecycle(_) => LIFECYCLE_CHANNEL,
-            Body::Subscribed { .. } => "subscribed",
-            Body::BookSnapshot { .. } => "orderbook_snapshot",
-            Body::BookDelta { .. } => "orderbook_delta",
-            Body::Ok => "ok",
-            Body::EventLifecycle => "event_lifecycle",
-            Body::Other { kind, .. } => kind,
-        }
-    }
-
-    fn is_book(&self) -> bool {
-        matches!(self, Body::BookSnapshot { .. } | Body::BookDelta { .. })
-    }
-}
-
-#[derive(Deserialize)]
-struct Envelope {
-    #[serde(rename = "type")]
-    kind: String,
-    sid: Option<u64>,
-    seq: Option<u64>,
-    sending_ts_ms: Option<i64>,
-    msg: Option<Value>,
-}
-
-#[derive(Deserialize)]
-struct SubscribedMsg {
-    channel: String,
-    sid: u64,
-}
-
-#[derive(Deserialize)]
-struct SnapshotMsg {
-    market_ticker: String,
-    clock: i64,
-    #[serde(default)]
-    yes_dollars_fp: Vec<(String, String)>,
-    #[serde(default)]
-    no_dollars_fp: Vec<(String, String)>,
-}
-
-#[derive(Deserialize)]
-struct DeltaMsg {
-    market_ticker: String,
-    clock: i64,
-    price_dollars: String,
-    delta_fp: String,
-    side: String,
-    ts_ms: Option<i64>,
-}
-
-/// Returns `None` for WebSocket frames that carry no message (ping, pong).
-fn parse_message(message: Message) -> anyhow::Result<Option<Frame>> {
-    let text = match message {
-        Message::Text(text) => text,
-        Message::Close(frame) => bail!("server closed the websocket: {frame:?}"),
-        _ => return Ok(None), // ping/pong are answered by the library
-    };
-    let envelope: Envelope = serde_json::from_str(text.as_str())?;
-    let mut timestamp_ms = envelope.sending_ts_ms;
-    let body = match (envelope.kind.as_str(), envelope.msg) {
-        (LIFECYCLE_CHANNEL, Some(msg)) => Body::Lifecycle(serde_json::from_value(msg)?),
-        ("subscribed", Some(msg)) => match serde_json::from_value::<SubscribedMsg>(msg) {
-            Ok(msg) => Body::Subscribed { channel: msg.channel, sid: msg.sid },
-            Err(_) => other(&envelope.kind, text.as_str()),
-        },
-        ("orderbook_snapshot", Some(msg)) => {
-            let msg: SnapshotMsg = serde_json::from_value(msg)?;
-            let levels = |side: Vec<(String, String)>| -> anyhow::Result<Vec<Level>> {
-                side.iter()
-                    .map(|(price, quantity)| Ok((parse_price(price)?, parse_fp(quantity)?)))
-                    .collect()
-            };
-            Body::BookSnapshot {
-                snapshot: BookSnapshot {
-                    clock: msg.clock,
-                    exchange_ms: timestamp_ms,
-                    yes: levels(msg.yes_dollars_fp)?,
-                    no: levels(msg.no_dollars_fp)?,
-                },
-                symbol: msg.market_ticker,
-            }
-        }
-        ("orderbook_delta", Some(msg)) => {
-            let msg: DeltaMsg = serde_json::from_value(msg)?;
-            timestamp_ms = msg.ts_ms.or(timestamp_ms);
-            let side = match msg.side.as_str() {
-                "yes" => BookSide::Yes,
-                "no" => BookSide::No,
-                other => bail!("unknown orderbook side `{other}`"),
-            };
-            Body::BookDelta {
-                delta: BookDelta {
-                    clock: msg.clock,
-                    exchange_ms: timestamp_ms,
-                    side,
-                    price: parse_price(&msg.price_dollars)?,
-                    delta: parse_fp(&msg.delta_fp)?,
-                },
-                symbol: msg.market_ticker,
-            }
-        }
-        ("ok", _) => Body::Ok,
-        ("event_lifecycle", _) => Body::EventLifecycle,
-        ("error", msg) => bail!("kalshi websocket error: {msg:?}"),
-        _ => other(&envelope.kind, text.as_str()),
-    };
-    Ok(Some(Frame {
-        sid: envelope.sid,
-        seq: envelope.seq,
-        timestamp_ms,
-        body,
-    }))
-}
-
-fn other(kind: &str, text: &str) -> Body {
-    Body::Other {
-        kind: kind.to_owned(),
-        raw: text.chars().take(300).collect(),
-    }
+/// Waits for whichever connection has something to report first.
+async fn next_heard(connections: &mut [Connection]) -> (usize, Heard) {
+    let waiting = connections.iter_mut().map(|connection| Box::pin(connection.next()));
+    let (heard, index, _) = futures_util::future::select_all(waiting).await;
+    (index, heard)
 }
 
 #[derive(Deserialize)]
@@ -805,35 +379,65 @@ struct RestMarket {
     close_time: Option<DateTime<Utc>>,
 }
 
-/// Pages `GET /markets?status=open`, leaving out multivariate (MVE) markets.
+/// Fetches the open markets, starting over after a pause for as long as it
+/// keeps failing.
 async fn fetch_open_markets(
     http: reqwest::Client,
     auth: Option<Arc<Auth>>,
-    url: String,
+    url: reqwest::Url,
     series: Option<String>,
+) -> OpenSet {
+    let mut pause = Duration::from_secs(1);
+    loop {
+        match page_open_markets(&http, &auth, &url, series.as_deref()).await {
+            Ok(open) => return open,
+            Err(error) => {
+                eprintln!("kalshi: fetching the open markets failed: {error:#}; trying again in {pause:?}");
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(MAX_FETCH_PAUSE);
+            }
+        }
+    }
+}
+
+/// Pages `GET /markets?status=open`, leaving out multivariate (MVE) markets.
+async fn page_open_markets(
+    http: &reqwest::Client,
+    auth: &Option<Arc<Auth>>,
+    url: &reqwest::Url,
+    series: Option<&str>,
 ) -> anyhow::Result<OpenSet> {
-    let url = reqwest::Url::parse(&url)?;
     let fetched_at = Utc::now().timestamp();
-    let mut markets = HashMap::new();
+    let mut markets = std::collections::HashMap::new();
     let mut cursor = String::new();
     loop {
-        let mut request = http.get(url.clone()).query(&[
-            ("status", "open"),
-            ("mve_filter", "exclude"),
-            ("limit", "1000"),
-        ]);
-        if let Some(series) = &series {
-            request = request.query(&[("series_ticker", series)]);
-        }
-        if !cursor.is_empty() {
-            request = request.query(&[("cursor", &cursor)]);
-        }
-        for (name, value) in auth_headers(&auth, "GET", url.path())? {
-            request = request.header(name, value);
-        }
-        let page: MarketsPage = request
-            .send()
-            .await?
+        // Kalshi answers 429 when requests come too fast. There is no
+        // penalty: the same page is simply asked for again a little later.
+        let mut pause = Duration::from_millis(250);
+        let response = loop {
+            let mut request = http.get(url.clone()).query(&[
+                ("status", "open"),
+                ("mve_filter", "exclude"),
+                ("limit", "1000"),
+            ]);
+            if let Some(series) = series {
+                request = request.query(&[("series_ticker", series)]);
+            }
+            if !cursor.is_empty() {
+                request = request.query(&[("cursor", &cursor)]);
+            }
+            for (name, value) in auth_headers(auth, "GET", url.path())? {
+                request = request.header(name, value);
+            }
+            let response = request.send().await?;
+            if response.status() != StatusCode::TOO_MANY_REQUESTS {
+                break response;
+            }
+            eprintln!("kalshi: REST rate limit reached; asking again in {pause:?}");
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(MAX_RATE_LIMIT_PAUSE);
+        };
+        let page: MarketsPage = response
             .error_for_status()?
             .json()
             .await

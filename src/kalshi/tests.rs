@@ -1,10 +1,17 @@
-//! Tests for the connection side of [`Kalshi`]: message parsing, and the
-//! whole loop driven by a mock Kalshi on localhost.
+//! Tests for [`Kalshi`] as a whole: message parsing, the REST fetch, and
+//! the whole loop driven by a mock Kalshi on localhost.
 
+use std::time::Instant;
+
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message;
 
-use super::book::ONE;
+use super::book::{Book, BookSide, BookSnapshot, ONE};
+use super::wire::{Body, parse_message};
 use super::*;
 
 fn text(json: &str) -> Message {
@@ -75,47 +82,6 @@ fn parses_the_documented_orderbook_examples() {
 }
 
 #[test]
-fn sequence_gaps_are_detected_per_subscription() {
-    let (mut kalshi, _events) = Kalshi::new(KalshiConfig::demo()).unwrap();
-    assert!(!kalshi.is_gap(1, 7), "the first message sets the baseline");
-    assert!(!kalshi.is_gap(1, 8));
-    assert!(!kalshi.is_gap(2, 1), "another subscription has its own count");
-    assert!(kalshi.is_gap(1, 10));
-    assert!(!kalshi.is_gap(1, 11), "counting resumes from the new baseline");
-}
-
-#[test]
-fn gaps_close_together_share_one_refetch() {
-    let (mut kalshi, _events) = Kalshi::new(KalshiConfig::demo()).unwrap();
-    let load = |kalshi: &mut Kalshi, symbol: &str| {
-        let snapshot = BookSnapshot { clock: 1, exchange_ms: None, yes: vec![], no: vec![] };
-        let book = kalshi.books.entry(symbol.to_owned()).or_insert_with(|| Synced::new(Book::default()));
-        book.on_snapshot(snapshot, &mut Vec::new()).unwrap();
-    };
-    load(&mut kalshi, "B");
-    load(&mut kalshi, "A");
-
-    // The first gap is answered at once, for every book.
-    kalshi.on_book_gap();
-    assert!(kalshi.refetch_at.unwrap() <= tokio::time::Instant::now());
-    assert_eq!(kalshi.take_stale_books(), ["A", "B"]);
-    assert!(kalshi.refetch_at.is_none());
-    let sent = kalshi.last_refetch.unwrap();
-
-    // A's new snapshot arrives, then two more gaps before B's does.
-    load(&mut kalshi, "A");
-    kalshi.on_book_gap();
-    kalshi.on_book_gap();
-    assert_eq!(kalshi.refetch_at, Some(sent + REFETCH_COOLDOWN), "one re-fetch, after the cooldown");
-    assert_eq!(kalshi.take_stale_books(), ["A", "B"], "a gap taints every book again");
-
-    // A book that loaded a snapshot after the last gap is not asked for again.
-    kalshi.on_book_gap();
-    load(&mut kalshi, "A");
-    assert_eq!(kalshi.take_stale_books(), ["B"]);
-}
-
-#[test]
 fn every_book_in_sync_is_published_each_interval() {
     let (mut kalshi, events) = Kalshi::new(KalshiConfig::demo()).unwrap();
     let book = |exchange_ms, yes| {
@@ -124,9 +90,10 @@ fn every_book_in_sync_is_published_each_interval() {
         book.on_snapshot(snapshot, &mut Vec::new()).unwrap();
         book
     };
-    kalshi.books.insert("B".to_owned(), book(Some(1_700_000_000_000), vec![(400_000, ONE)]));
-    kalshi.books.insert("A".to_owned(), book(None, vec![]));
-    kalshi.books.insert("WAITING".to_owned(), Synced::new(Book::default()));
+    let books = &mut kalshi.connections[0].books;
+    books.insert("B".to_owned(), book(Some(1_700_000_000_000), vec![(400_000, ONE)]));
+    books.insert("A".to_owned(), book(None, vec![]));
+    books.insert("WAITING".to_owned(), Synced::new(Book::default()));
     let due = kalshi.next_snapshot;
 
     kalshi.publish_snapshots();
@@ -149,6 +116,14 @@ fn every_book_in_sync_is_published_each_interval() {
 
 /// Serves one page of open markets, "A" and "B", to every request.
 async fn mock_rest(listener: TcpListener) {
+    serve_markets(listener, vec!["A".to_owned(), "B".to_owned()]).await
+}
+
+/// Serves `tickers` as one page of open markets to every request.
+async fn serve_markets(listener: TcpListener, tickers: Vec<String>) {
+    let markets: Vec<Value> =
+        tickers.iter().map(|ticker| json!({"ticker": ticker, "close_time": "2099-01-01T00:00:00Z"})).collect();
+    let body = json!({"markets": markets, "cursor": ""}).to_string();
     loop {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut request = Vec::new();
@@ -159,14 +134,41 @@ async fn mock_rest(listener: TcpListener) {
         }
         let request = String::from_utf8_lossy(&request);
         assert!(request.contains("mve_filter=exclude"), "MVEs must be excluded: {request}");
-        let body = r#"{"markets":[{"ticker":"A","close_time":"2099-01-01T00:00:00Z"},
-            {"ticker":"B","close_time":"2099-01-01T00:00:00Z"}],"cursor":""}"#;
-        let response = format!(
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(body.as_bytes()).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_rate_limited_page_is_asked_for_again() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = reqwest::Url::parse(&format!("http://{}/trade-api/v2/markets", listener.local_addr().unwrap())).unwrap();
+    let served = tokio::spawn(async move {
+        let body = r#"{"markets":[{"ticker":"A","close_time":"2099-01-01T00:00:00Z"}],"cursor":""}"#;
+        let ok = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
         );
-        stream.write_all(response.as_bytes()).await.unwrap();
-    }
+        let limited = "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned();
+        for response in [limited, ok] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let mut chunk = [0u8; 1024];
+                let n = stream.read(&mut chunk).await.unwrap();
+                request.extend_from_slice(&chunk[..n]);
+            }
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+
+    let open = page_open_markets(&reqwest::Client::new(), &None, &url, None).await.unwrap();
+    assert_eq!(open.markets.keys().collect::<Vec<_>>(), ["A"]);
+    served.await.unwrap();
 }
 
 type ServerWs = WebSocketStream<TcpStream>;
@@ -269,13 +271,7 @@ fn summarize(event: Event) -> String {
 
 #[tokio::test]
 async fn stays_in_sync_with_a_mock_kalshi() {
-    let rest = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let websocket = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut config = KalshiConfig::demo();
-    config.rest_url = format!("http://{}/trade-api/v2", rest.local_addr().unwrap());
-    config.ws_url = format!("ws://{}/trade-api/ws/v2", websocket.local_addr().unwrap());
-    let (mut kalshi, events) = Kalshi::new(config).unwrap();
-
+    let (mut kalshi, events, rest, websocket) = against_mocks().await;
     tokio::spawn(mock_rest(rest));
     let script = tokio::spawn(mock_websocket(websocket));
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -326,6 +322,146 @@ async fn stays_in_sync_with_a_mock_kalshi() {
     );
 }
 
+/// A `Kalshi` pointed at mocks on localhost, and the two listeners.
+async fn against_mocks() -> (Kalshi, Receiver<Event>, TcpListener, TcpListener) {
+    let rest = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let websocket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = KalshiConfig::demo();
+    config.rest_url = format!("http://{}/trade-api/v2", rest.local_addr().unwrap());
+    config.ws_url = format!("ws://{}/trade-api/ws/v2", websocket.local_addr().unwrap());
+    let (kalshi, events) = Kalshi::new(config).unwrap();
+    (kalshi, events, rest, websocket)
+}
+
+async fn accept(listener: &TcpListener) -> ServerWs {
+    let (stream, _) = listener.accept().await.unwrap();
+    tokio_tungstenite::accept_async(stream).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_lost_connection_is_reopened_and_resubscribed() {
+    let (mut kalshi, events, rest, websocket) = against_mocks().await;
+    tokio::spawn(mock_rest(rest));
+    let script = tokio::spawn(async move {
+        let mut ws = accept(&websocket).await;
+        assert_eq!(next_command(&mut ws).await["params"]["channels"], json!(["market_lifecycle_v2"]));
+        assert_eq!(next_command(&mut ws).await["params"]["market_tickers"], json!(["A", "B"]));
+        send(&mut ws, snapshot(1, "A", 100, "20.00")).await;
+        // The connection dies without a word.
+        drop(ws);
+
+        // The new socket is told about every symbol at once, without
+        // waiting for REST, and Kalshi starts its numbering again.
+        let mut ws = accept(&websocket).await;
+        assert_eq!(next_command(&mut ws).await["params"]["channels"], json!(["market_lifecycle_v2"]));
+        let command = next_command(&mut ws).await;
+        assert_eq!(command["params"]["channels"], json!(["orderbook_delta"]));
+        assert_eq!(command["params"]["market_tickers"], json!(["A", "B"]));
+        send(&mut ws, snapshot(1, "A", 107, "12.00")).await;
+        send(&mut ws, snapshot(2, "B", 107, "30.00")).await;
+        send(&mut ws, delta(3, "A", 108, "2.00")).await;
+        // The reply to this proves everything above was handled.
+        send(&mut ws, lifecycle(1, "B", "settled")).await;
+        assert_eq!(next_command(&mut ws).await["params"]["action"], "delete_markets");
+        ws
+    });
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let client = tokio::spawn(async move {
+        kalshi.run(async { let _ = stopped.await; }).await;
+    });
+    let _server = tokio::time::timeout(Duration::from_secs(10), script)
+        .await
+        .expect("the client should reconnect")
+        .expect("every command should match the script");
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), client).await.expect("run should return").unwrap();
+
+    let mut seen: Vec<String> = events.try_iter().map(summarize).collect();
+    seen[..2].sort();
+    let asks = "[(420000, 10000000)]";
+    assert_eq!(
+        seen,
+        [
+            "+A".to_owned(),
+            "+B".to_owned(),
+            format!("snapshot A bids=[(400000, 20000000)] asks={asks}"),
+            // After the reconnect every book starts again from a snapshot.
+            format!("snapshot A bids=[(400000, 12000000)] asks={asks}"),
+            format!("snapshot B bids=[(400000, 30000000)] asks={asks}"),
+            "level A Buy 400000 14000000".to_owned(),
+            "-B".to_owned(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn many_symbols_are_subscribed_in_batches_in_order() {
+    let (mut kalshi, _events, rest, websocket) = against_mocks().await;
+    let tickers: Vec<String> = (0..1200).map(|n| format!("M{n:04}")).collect();
+    tokio::spawn(serve_markets(rest, tickers.clone()));
+    let script = tokio::spawn(async move {
+        let mut ws = accept(&websocket).await;
+        assert_eq!(next_command(&mut ws).await["params"]["channels"], json!(["market_lifecycle_v2"]));
+        let mut asked = Vec::new();
+        for expected in [500, 500, 200] {
+            let command = next_command(&mut ws).await;
+            let batch = command["params"]["market_tickers"].as_array().unwrap().clone();
+            assert_eq!(batch.len(), expected);
+            asked.extend(batch.into_iter().map(|ticker| ticker.as_str().unwrap().to_owned()));
+        }
+        assert_eq!(asked, tickers);
+    });
+    tokio::select! {
+        _ = kalshi.run(std::future::pending()) => unreachable!("run only returns on shutdown"),
+        done = tokio::time::timeout(Duration::from_secs(10), script) => done.expect("in time").unwrap(),
+    }
+}
+
+/// Kalshi stops reading while megabytes of subscribe commands are still
+/// waiting to be sent. Messages it sends must still be read and acted on.
+#[tokio::test]
+async fn unsent_commands_do_not_stop_messages_being_read() {
+    let (mut kalshi, events, rest, websocket) = against_mocks().await;
+    // Long tickers: about 18 MB of subscribe commands, more than the socket
+    // buffers between the two ends can hold.
+    let tickers: Vec<String> = (0..60_000).map(|n| format!("M{n:05}-{}", "X".repeat(290))).collect();
+    tokio::spawn(serve_markets(rest, tickers));
+    let (go, gone) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let mut ws = accept(&websocket).await;
+        assert_eq!(next_command(&mut ws).await["params"]["channels"], json!(["market_lifecycle_v2"]));
+        // From here on nothing more is read from the socket.
+        gone.await.unwrap();
+        send(&mut ws, lifecycle(1, "LATE", "activated")).await;
+        std::future::pending::<()>().await;
+    });
+    let client = tokio::spawn(async move { kalshi.run(std::future::pending()).await });
+
+    // Wait until the symbols are loaded, which queues the commands...
+    let wait_for = |wanted: String| {
+        let events = events.clone();
+        async move {
+            loop {
+                if events.try_iter().any(|event| event == Event::Symbol(SymbolChange::Added(wanted.clone()))) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    };
+    let last = format!("M59999-{}", "X".repeat(290));
+    tokio::time::timeout(Duration::from_secs(30), wait_for(last))
+        .await
+        .expect("the symbols should load");
+    // ...then have Kalshi speak, and expect to hear it.
+    go.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), wait_for("LATE".to_owned()))
+        .await
+        .expect("a message must be read even though commands are still unsent");
+    client.abort();
+    server.abort();
+}
+
 /// Live check against the demo environment; needs network, no API key.
 /// Run with `cargo test live -- --ignored --nocapture`.
 #[tokio::test]
@@ -333,8 +469,8 @@ async fn stays_in_sync_with_a_mock_kalshi() {
 async fn live_demo_rest() {
     let config = KalshiConfig::demo();
     let started = Instant::now();
-    let url = format!("{}/markets", config.rest_url);
-    let open = fetch_open_markets(reqwest::Client::new(), None, url, None).await.unwrap();
+    let url = reqwest::Url::parse(&format!("{}/markets", config.rest_url)).unwrap();
+    let open = page_open_markets(&reqwest::Client::new(), &None, &url, None).await.unwrap();
     let past = open.markets.values().filter(|c| c.is_some_and(|c| c <= open.fetched_at)).count();
     let combos = open.markets.keys().filter(|t| t.starts_with("KXMVE")).count();
     println!(
