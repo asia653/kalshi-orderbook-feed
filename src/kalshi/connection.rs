@@ -6,6 +6,11 @@
 //! sending commands, checking sequence numbers, and re-fetching books after
 //! a gap.
 //!
+//! Several connections can follow the same symbols. Each keeps its own
+//! books, but only the one its owner has made the source reports changes to
+//! them; the others stay ready to take over. [`Heard::InSync`] and
+//! [`Heard::OutOfSync`] tell the owner which connections could.
+//!
 //! Commands are queued, never awaited. They are written by the same call
 //! that reads, [`Connection::next`], so a socket that is slow to accept
 //! them cannot hold up anything else.
@@ -39,6 +44,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const REFETCH_COOLDOWN: Duration = Duration::from_secs(5);
 /// How long a closing handshake may take before the socket is just dropped.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long opening a WebSocket may take before the attempt counts as failed.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -54,8 +61,14 @@ pub(super) enum Heard {
     /// A message was missed on a subscription other than the order books,
     /// so a lifecycle message may be missing.
     Missed,
-    /// A book was loaded or changed.
+    /// A book was loaded or changed. Only the source reports these.
     Book(Event),
+    /// Every book that needed a snapshot when the socket opened, or after
+    /// the last sequence gap, has loaded one: this connection's books can be
+    /// trusted as a whole.
+    InSync,
+    /// A sequence gap: no book can be trusted until it has been re-fetched.
+    OutOfSync,
     /// A message type we do not act on; `raw` is its (shortened) text.
     Unhandled { kind: String, raw: String },
 }
@@ -78,6 +91,10 @@ enum Step {
 }
 
 pub(super) struct Connection {
+    /// Its position among the owner's connections; used in log lines.
+    id: usize,
+    /// Whether this is the source, whose book changes are reported.
+    reporting: bool,
     ws_url: String,
     auth: Option<Arc<Auth>>,
     link: Link,
@@ -95,6 +112,14 @@ pub(super) struct Connection {
     // Everything below belongs to the open socket and is reset when it is lost.
     /// A book for every symbol this connection follows.
     pub(super) books: HashMap<String, Synced<Book>>,
+    /// Symbols whose snapshot is still needed before the books as a whole
+    /// can be trusted. Filled when the socket opens and on a sequence gap.
+    /// A symbol added at any other time is not included: its snapshot is on
+    /// its way, and a steady trickle of new symbols must not keep a
+    /// connection from ever counting as in sync.
+    catching_up: HashSet<String>,
+    /// See [`Heard::InSync`].
+    in_sync: bool,
     /// Symbols Kalshi has been asked to send books for.
     subscribed: HashSet<String>,
     /// Subscription id of the orderbook channel, once Kalshi has told us.
@@ -112,8 +137,10 @@ pub(super) struct Connection {
 
 impl Connection {
     /// A connection that makes its first attempt as soon as it is polled.
-    pub(super) fn new(ws_url: String, auth: Option<Arc<Auth>>) -> Self {
+    pub(super) fn new(id: usize, ws_url: String, auth: Option<Arc<Auth>>) -> Self {
         Self {
+            id,
+            reporting: false,
             ws_url,
             auth,
             link: Link::Waiting(tokio::time::Instant::now()),
@@ -123,6 +150,8 @@ impl Connection {
             unflushed: false,
             heard: VecDeque::new(),
             books: HashMap::new(),
+            catching_up: HashSet::new(),
+            in_sync: false,
             subscribed: HashSet::new(),
             book_sid: None,
             deferred: Vec::new(),
@@ -135,6 +164,28 @@ impl Connection {
 
     pub(super) fn is_open(&self) -> bool {
         matches!(self.link, Link::Open(_))
+    }
+
+    pub(super) fn in_sync(&self) -> bool {
+        self.in_sync
+    }
+
+    /// How many books are waiting for a snapshot.
+    pub(super) fn waiting(&self) -> usize {
+        self.books.values().filter(|book| !book.is_live()).count()
+    }
+
+    /// Makes this connection the source, or stops it being the source.
+    pub(super) fn set_reporting(&mut self, reporting: bool) {
+        self.reporting = reporting;
+    }
+
+    /// Drops the socket without a closing handshake, as a network failure
+    /// would. The connection then reconnects as after any other loss.
+    pub(super) fn drop_socket(&mut self, why: &str) {
+        if self.is_open() {
+            self.lose(anyhow!("{why}"));
+        }
     }
 
     /// Waits for the next thing worth reporting, doing the connection's own
@@ -181,6 +232,7 @@ impl Connection {
                 Step::Refetch => {
                     let stale = self.take_stale_books();
                     self.update_books("get_snapshot", stale);
+                    self.settle();
                 }
             }
         }
@@ -204,7 +256,7 @@ impl Connection {
             }
         };
         if tokio::time::timeout(CLOSE_TIMEOUT, handshake).await.is_err() {
-            eprintln!("kalshi: no close acknowledgement; dropping the connection");
+            eprintln!("kalshi[{}]: no close acknowledgement; dropping the connection", self.id);
         }
     }
 
@@ -216,8 +268,9 @@ impl Connection {
             for (name, value) in auth_headers(&auth, "GET", &path)? {
                 request.headers_mut().insert(name, value.parse()?);
             }
-            let (ws, _) = tokio_tungstenite::connect_async(request)
+            let (ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
                 .await
+                .context("websocket connect timed out")?
                 .context("websocket connect")?;
             Ok(ws)
         })
@@ -236,6 +289,8 @@ impl Connection {
         self.outbox.clear();
         self.unflushed = false;
         self.books.clear();
+        self.catching_up.clear();
+        self.in_sync = false;
         self.subscribed.clear();
         self.book_sid = None;
         self.deferred.clear();
@@ -259,9 +314,17 @@ impl Connection {
         self.command("subscribe", json!({ "channels": [LIFECYCLE_CHANNEL] }));
     }
 
+    /// Follows `symbols` on a socket that has just opened. The connection
+    /// is in sync once every one of them has loaded a snapshot.
+    pub(super) fn follow_all(&mut self, symbols: Vec<String>) {
+        self.catching_up = symbols.iter().cloned().collect();
+        let added: Vec<SymbolChange> = symbols.into_iter().map(SymbolChange::Added).collect();
+        self.on_symbol_changes(&added);
+    }
+
     /// Creates and drops books to match the symbol list and tells Kalshi.
     /// Does nothing while the socket is not open: once it opens, the owner
-    /// passes every current symbol as added.
+    /// calls [`Connection::follow_all`] with every current symbol.
     pub(super) fn on_symbol_changes(&mut self, changes: &[SymbolChange]) {
         if !self.is_open() {
             return;
@@ -284,6 +347,7 @@ impl Connection {
                 }
                 SymbolChange::Removed(symbol) => {
                     self.books.remove(symbol);
+                    self.catching_up.remove(symbol);
                     refresh.remove(symbol);
                     if !subscribe.remove(symbol) && self.subscribed.contains(symbol) {
                         unsubscribe.insert(symbol.clone());
@@ -297,6 +361,15 @@ impl Connection {
         }
         self.update_books("delete_markets", unsubscribe.into_iter().collect());
         self.update_books("get_snapshot", refresh.into_iter().collect());
+        self.settle();
+    }
+
+    /// Notices the moment every book has caught up.
+    fn settle(&mut self) {
+        if self.is_open() && !self.in_sync && self.catching_up.is_empty() && self.refetch_at.is_none() {
+            self.in_sync = true;
+            self.heard.push_back(Heard::InSync);
+        }
     }
 
     /// Asks Kalshi for the books of `symbols`. A repeated subscribe adds
@@ -358,7 +431,8 @@ impl Connection {
             let last = self.last_seq.get(&sid).copied();
             if let (true, Some(last)) = (self.is_gap(sid, seq), last) {
                 eprintln!(
-                    "kalshi: sequence gap on subscription {sid}: expected {}, got {seq} ({})",
+                    "kalshi[{}]: sequence gap on subscription {sid}: expected {}, got {seq} ({})",
+                    self.id,
                     last + 1,
                     frame.body.kind(),
                 );
@@ -377,7 +451,7 @@ impl Connection {
         match frame.body {
             Body::Lifecycle(event) => self.heard.push_back(Heard::Lifecycle(event)),
             Body::Subscribed { channel, sid } => {
-                eprintln!("kalshi: subscribed to {channel} as subscription {sid}");
+                eprintln!("kalshi[{}]: subscribed to {channel} as subscription {sid}", self.id);
                 if channel == BOOK_CHANNEL {
                     self.learn_book_sid(sid);
                 }
@@ -389,7 +463,9 @@ impl Connection {
                 if let Some(book) = self.books.get_mut(&symbol) {
                     let mut changes = Vec::new();
                     book.on_snapshot(snapshot, &mut changes)?;
+                    self.catching_up.remove(&symbol);
                     self.report(&symbol, changes, received_at, exchange_timestamp);
+                    self.settle();
                 }
             }
             Body::BookDelta { symbol, delta } => {
@@ -399,7 +475,7 @@ impl Connection {
                     let applied = book.on_delta(delta, &mut changes);
                     self.report(&symbol, changes, received_at, exchange_timestamp);
                     if let Err(error) = applied {
-                        eprintln!("kalshi: {symbol}: {error:#}; requesting a snapshot");
+                        eprintln!("kalshi[{}]: {symbol}: {error:#}; requesting a snapshot", self.id);
                         self.update_books("get_snapshot", vec![symbol]);
                     }
                 }
@@ -424,6 +500,10 @@ impl Connection {
         for book in self.books.values_mut() {
             book.invalidate();
         }
+        self.catching_up = self.books.keys().cloned().collect();
+        if std::mem::take(&mut self.in_sync) {
+            self.heard.push_back(Heard::OutOfSync);
+        }
         let now = tokio::time::Instant::now();
         let earliest = self.last_refetch.map_or(now, |last| last + REFETCH_COOLDOWN);
         self.refetch_at.get_or_insert(earliest.max(now));
@@ -442,7 +522,7 @@ impl Connection {
             .map(|(symbol, _)| symbol.clone())
             .collect();
         stale.sort();
-        eprintln!("kalshi: re-fetching {} books after a sequence gap", stale.len());
+        eprintln!("kalshi[{}]: re-fetching {} books after a sequence gap", self.id, stale.len());
         stale
     }
 
@@ -457,6 +537,9 @@ impl Connection {
         let Some(book) = self.books.get(symbol) else {
             return;
         };
+        if !self.reporting {
+            return;
+        }
         for change in changes {
             let event = match change {
                 BookChange::Replaced => Event::Snapshot {
@@ -521,7 +604,7 @@ mod tests {
     use super::*;
 
     fn connection() -> Connection {
-        Connection::new("ws://unused".to_owned(), None)
+        Connection::new(0, "ws://unused".to_owned(), None)
     }
 
     #[test]
@@ -572,7 +655,7 @@ mod tests {
     fn commands_are_dropped_while_the_socket_is_not_open() {
         let mut connection = connection();
         connection.subscribe_lifecycle();
-        connection.on_symbol_changes(&[SymbolChange::Added("A".to_owned())]);
+        connection.follow_all(vec!["A".to_owned()]);
         assert!(connection.outbox.is_empty() && connection.books.is_empty());
     }
 }

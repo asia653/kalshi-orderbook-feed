@@ -12,6 +12,12 @@
 //!
 //! [`Kalshi`] owns the symbol list and the REST fetch. Each WebSocket, with
 //! the books built from it, is a [`connection::Connection`].
+//!
+//! Several connections follow the same symbols so that one can fail without
+//! losing the feed. One of them is the *source*: only its books are
+//! published. When the source is lost or misses a message and another
+//! connection is in sync, that one becomes the source, and every one of its
+//! books is published in full before its changes continue.
 
 mod book;
 mod connection;
@@ -29,6 +35,7 @@ use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use futures_util::future::BoxFuture;
+use futures_util::{Stream, StreamExt};
 use reqwest::StatusCode;
 use rsa::RsaPrivateKey;
 use rsa::pkcs1::DecodeRsaPrivateKey;
@@ -95,6 +102,9 @@ pub struct KalshiConfig {
     pub reconcile_interval: Duration,
     /// How often every book is published in full.
     pub snapshot_interval: Duration,
+    /// How many WebSockets follow the symbols. One is the source; the rest
+    /// are ready to take over from it.
+    pub connections: usize,
 }
 
 impl KalshiConfig {
@@ -114,12 +124,14 @@ impl KalshiConfig {
             series_ticker: None,
             reconcile_interval: Duration::from_secs(300),
             snapshot_interval: Duration::from_secs(60),
+            connections: 2,
         }
     }
 
     /// Reads `KALSHI_ENV` (`demo` by default, or `prod`), `KALSHI_API_KEY_ID`,
-    /// `KALSHI_PRIVATE_KEY_PATH` and optionally `KALSHI_SERIES_TICKER`.
-    /// `KALSHI_REST_URL` and `KALSHI_WS_URL` override the environment's URLs.
+    /// `KALSHI_PRIVATE_KEY_PATH` and optionally `KALSHI_SERIES_TICKER` and
+    /// `KALSHI_CONNECTIONS` (2 by default). `KALSHI_REST_URL` and
+    /// `KALSHI_WS_URL` override the environment's URLs.
     pub fn from_env() -> anyhow::Result<Self> {
         let mut config = match std::env::var("KALSHI_ENV").as_deref() {
             Ok("prod") => Self::prod(),
@@ -133,6 +145,9 @@ impl KalshiConfig {
             .with_context(|| format!("reading private key at {key_path}"))?;
         config.credentials = Some((key_id, pem));
         config.series_ticker = std::env::var("KALSHI_SERIES_TICKER").ok();
+        if let Ok(connections) = std::env::var("KALSHI_CONNECTIONS") {
+            config.connections = connections.parse().context("KALSHI_CONNECTIONS must be a number")?;
+        }
         if let Ok(url) = std::env::var("KALSHI_REST_URL") {
             config.rest_url = url;
         }
@@ -160,9 +175,14 @@ pub struct Kalshi {
     /// When every book is next published in full.
     next_snapshot: tokio::time::Instant,
 
-    /// For now exactly one, which supplies both the lifecycle messages and
-    /// the books that are published.
     connections: Vec<Connection>,
+    /// The connection whose books are published.
+    source: usize,
+    /// The connection whose lifecycle messages are applied. It only needs
+    /// to be open, so it can differ from the source.
+    lead: usize,
+    /// Which connection is asked first for news, so none is starved.
+    turn: usize,
     /// Message types we do not handle and have already logged once.
     unhandled: HashSet<String>,
 }
@@ -190,7 +210,11 @@ impl Kalshi {
         let (events, events_rx) = unbounded();
         let symbols = Synced::new(SymbolList::new(config.series_ticker.clone()));
         let next_snapshot = tokio::time::Instant::now() + config.snapshot_interval;
-        let connections = vec![Connection::new(config.ws_url.clone(), auth.clone())];
+        anyhow::ensure!(config.connections >= 1, "at least one connection is needed");
+        let mut connections: Vec<Connection> = (0..config.connections)
+            .map(|id| Connection::new(id, config.ws_url.clone(), auth.clone()))
+            .collect();
+        connections[0].set_reporting(true);
         let kalshi = Self {
             config,
             auth,
@@ -202,6 +226,9 @@ impl Kalshi {
             fetch: None,
             next_snapshot,
             connections,
+            source: 0,
+            lead: 0,
+            turn: 0,
             unhandled: HashSet::new(),
         };
         Ok((kalshi, events_rx))
@@ -213,8 +240,21 @@ impl Kalshi {
     }
 
     /// Connects and stays in sync until `shutdown` completes, then closes the
-    /// WebSocket and returns. A failed connection is reopened after a pause.
+    /// WebSockets and returns. A failed connection is reopened after a pause.
     pub async fn run(&mut self, shutdown: impl Future<Output = ()>) {
+        self.run_with_faults(shutdown, futures_util::stream::pending()).await
+    }
+
+    /// Like [`Kalshi::run`], and every item of `drop_source` cuts the
+    /// source's socket as a network failure would. For seeing a switch of
+    /// source happen on demand.
+    pub async fn run_with_faults(
+        &mut self,
+        shutdown: impl Future<Output = ()>,
+        drop_source: impl Stream<Item = ()> + Unpin,
+    ) {
+        // Fused, so a stream that ends is simply never heard from again.
+        let mut drop_source = drop_source.fuse();
         tokio::pin!(shutdown);
         let mut reconcile = tokio::time::interval(self.config.reconcile_interval);
         reconcile.tick().await; // the first tick fires immediately
@@ -223,9 +263,14 @@ impl Kalshi {
             let next_snapshot = self.next_snapshot;
             let fetching = self.fetch.is_some();
             let (connections, fetch) = (&mut self.connections, &mut self.fetch);
+            self.turn = self.turn.wrapping_add(1);
             tokio::select! {
                 _ = &mut shutdown => break,
-                (index, heard) = next_heard(connections) => self.on_heard(index, heard),
+                (index, heard) = next_heard(connections, self.turn) => self.on_heard(index, heard),
+                Some(()) = drop_source.next() => {
+                    eprintln!("kalshi: dropping connection {} on request", self.source);
+                    self.connections[self.source].drop_socket("dropped on request");
+                }
                 open = async { fetch.as_mut().expect("guarded").await }, if fetching => {
                     self.fetch = None;
                     let mut changes = Vec::new();
@@ -245,13 +290,11 @@ impl Kalshi {
             // Listen before fetching: lifecycle messages that arrive while
             // REST is paging are held by `self.symbols` and replayed after
             // the load. So a fetch only starts while someone is listening.
-            if self.symbols_stale && self.fetch.is_none() && self.connections[0].is_open() {
+            if self.symbols_stale && self.fetch.is_none() && self.connections[self.lead].is_open() {
                 self.fetch = Some(self.start_fetch());
             }
         }
-        for connection in &mut self.connections {
-            connection.close().await;
-        }
+        futures_util::future::join_all(self.connections.iter_mut().map(Connection::close)).await;
     }
 
     // ---- reacting ---------------------------------------------------------
@@ -259,38 +302,75 @@ impl Kalshi {
     fn on_heard(&mut self, index: usize, heard: Heard) {
         match heard {
             Heard::Opened => {
-                // A new socket has no subscriptions. Follow every current
-                // symbol, and re-fetch the list: changes made while nothing
-                // was listening were missed.
-                let following: Vec<SymbolChange> =
-                    self.symbols().into_iter().map(SymbolChange::Added).collect();
+                // A new socket has no subscriptions: follow every current symbol.
+                let following = self.symbols();
                 let connection = &mut self.connections[index];
                 connection.subscribe_lifecycle();
-                connection.on_symbol_changes(&following);
-                self.symbols_stale = true;
+                connection.follow_all(following);
+                if index == self.lead || !self.connections[self.lead].is_open() {
+                    self.follow_lead(index);
+                }
             }
             Heard::Lost(error) => {
-                eprintln!("kalshi: session ended: {error:#}");
-                // Nothing is listening, so a fetch in progress could not be
-                // trusted. A new one starts when the socket is open again.
-                self.fetch = None;
-                self.symbols_stale = true;
+                eprintln!("kalshi[{index}]: connection lost: {error:#}");
+                if index == self.lead {
+                    let open = (0..self.connections.len()).find(|&i| self.connections[i].is_open());
+                    self.follow_lead(open.unwrap_or(index));
+                }
+                self.choose_source();
             }
-            Heard::Missed => self.symbols_stale = true,
-            Heard::Lifecycle(event) => {
+            Heard::InSync | Heard::OutOfSync => self.choose_source(),
+            // Only the lead's lifecycle messages count. Mixing two streams
+            // would let a slow one undo what the other has already said.
+            Heard::Missed if index == self.lead => self.symbols_stale = true,
+            Heard::Lifecycle(event) if index == self.lead => {
                 let mut changes = Vec::new();
                 match self.symbols.on_delta(event, &mut changes) {
                     Ok(()) => self.on_symbol_changes(changes),
                     Err(error) => self.distrust_symbols(error),
                 }
             }
-            Heard::Book(event) => self.publish(event),
+            Heard::Missed | Heard::Lifecycle(_) => {}
+            // A connection that has just stopped being the source may still
+            // have changes queued; they are no longer wanted.
+            Heard::Book(event) if index == self.source => self.publish(event),
+            Heard::Book(_) => {}
             Heard::Unhandled { kind, raw } => {
                 if self.unhandled.insert(kind.clone()) {
                     eprintln!("kalshi: not handling `{kind}` messages; the first one: {raw}");
                 }
             }
         }
+    }
+
+    /// Takes lifecycle messages from `lead` from now on. Whatever was said
+    /// while nobody was listening, or on the old lead after the new one
+    /// stopped hearing it, is unknown, so the list is fetched again; a fetch
+    /// already in progress could have missed the same things.
+    fn follow_lead(&mut self, lead: usize) {
+        self.lead = lead;
+        self.fetch = None;
+        self.symbols_stale = true;
+    }
+
+    /// Keeps the source if its books can be trusted. Otherwise moves to a
+    /// connection whose books can, if there is one, and publishes all of
+    /// its books: the two connections may have seen different things, and a
+    /// full snapshot of each book replaces whatever the old source said.
+    fn choose_source(&mut self) {
+        if self.connections[self.source].in_sync() {
+            return;
+        }
+        let Some(next) = (0..self.connections.len()).find(|&i| self.connections[i].in_sync()) else {
+            // Nobody is better. The source catches up by itself, publishing
+            // each book's fresh snapshot as it arrives.
+            return;
+        };
+        eprintln!("kalshi: the source is now connection {next} (was {})", self.source);
+        self.connections[self.source].set_reporting(false);
+        self.connections[next].set_reporting(true);
+        self.source = next;
+        self.publish_books();
     }
 
     /// Passes changes to the symbol list on to every connection, and
@@ -322,12 +402,28 @@ impl Kalshi {
         ))
     }
 
-    /// Publishes every book that is in sync, in full, in symbol order. A
-    /// book still waiting for its snapshot is left out: there is nothing
-    /// trustworthy to say about it yet.
+    /// The once-a-minute publication of every book.
     fn publish_snapshots(&mut self) {
+        self.publish_books();
+        for (index, connection) in self.connections.iter().enumerate() {
+            if !connection.is_open() {
+                eprintln!("kalshi[{index}]: not connected");
+            } else if connection.waiting() > 0 {
+                eprintln!("kalshi[{index}]: {} books are waiting for a snapshot", connection.waiting());
+            }
+        }
+        // Keep a steady cadence, unless we have fallen a whole interval behind.
+        let now = tokio::time::Instant::now();
+        let next = self.next_snapshot + self.config.snapshot_interval;
+        self.next_snapshot = if next > now { next } else { now + self.config.snapshot_interval };
+    }
+
+    /// Publishes every one of the source's books that is in sync, in full,
+    /// in symbol order. A book still waiting for its snapshot is left out:
+    /// there is nothing trustworthy to say about it yet.
+    fn publish_books(&self) {
         let received_at = Utc::now();
-        let mut live: Vec<(&String, &Synced<book::Book>)> = self.connections[0]
+        let mut live: Vec<(&String, &Synced<book::Book>)> = self.connections[self.source]
             .books
             .iter()
             .filter(|(_, book)| book.is_live())
@@ -347,10 +443,6 @@ impl Kalshi {
                     .unwrap_or(received_at),
             });
         }
-        // Keep a steady cadence, unless we have fallen a whole interval behind.
-        let now = tokio::time::Instant::now();
-        let next = self.next_snapshot + self.config.snapshot_interval;
-        self.next_snapshot = if next > now { next } else { now + self.config.snapshot_interval };
     }
 
     fn publish(&self, event: Event) {
@@ -359,11 +451,19 @@ impl Kalshi {
     }
 }
 
-/// Waits for whichever connection has something to report first.
-async fn next_heard(connections: &mut [Connection]) -> (usize, Heard) {
-    let waiting = connections.iter_mut().map(|connection| Box::pin(connection.next()));
-    let (heard, index, _) = futures_util::future::select_all(waiting).await;
-    (index, heard)
+/// Waits for whichever connection has something to report first. When
+/// several do, the one at position `turn` (wrapping around) wins, and the
+/// caller advances `turn` so a busy connection cannot starve the others.
+async fn next_heard(connections: &mut [Connection], turn: usize) -> (usize, Heard) {
+    let first = turn % connections.len();
+    let mut waiting: Vec<_> = connections
+        .iter_mut()
+        .enumerate()
+        .map(|(index, connection)| Box::pin(async move { (index, connection.next().await) }))
+        .collect();
+    waiting.rotate_left(first);
+    let (heard, _, _) = futures_util::future::select_all(waiting).await;
+    heard
 }
 
 #[derive(Deserialize)]

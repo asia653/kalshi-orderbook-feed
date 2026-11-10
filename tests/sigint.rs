@@ -94,6 +94,8 @@ async fn scenario() {
             .env("KALSHI_PRIVATE_KEY_PATH", key_file.path())
             .env("KALSHI_REST_URL", rest_url)
             .env("KALSHI_WS_URL", ws_url)
+            // The mock plays one connection's script.
+            .env("KALSHI_CONNECTIONS", "1")
             .stdout(Stdio::from(stdout.reopen().unwrap()))
             .spawn()
             .unwrap(),

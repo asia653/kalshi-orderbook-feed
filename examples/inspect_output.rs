@@ -10,8 +10,11 @@
 //!
 //! Snapshots come in two kinds, told apart by their timestamps:
 //!
-//! * a *round* is the once-a-minute snapshot of every book, all stamped with
-//!   the same `received_at`. It must match the rebuilt book exactly.
+//! * a *round* is a snapshot of every book at once, all stamped with the
+//!   same `received_at`. The once-a-minute round must match the rebuilt book
+//!   exactly. A round is also written when the service switches to another
+//!   connection as its source; that one may differ, which is why it is
+//!   written.
 //! * a *fetched* snapshot came from Kalshi (first subscribe, or a re-fetch
 //!   after a sequence gap). It may differ: that is why it was fetched.
 
@@ -162,7 +165,10 @@ fn main() -> anyhow::Result<()> {
     );
     println!("updates for a symbol with no snapshot yet: {unknown_symbol}");
     println!("snapshots whose best bid is at or above the best ask: {crossed}");
-    println!("minute rounds that disagree with the rebuilt book: {}", bad_round.len());
+    println!(
+        "snapshots in a round that disagree with the rebuilt book: {} (expected only after a switch of source)",
+        bad_round.len()
+    );
     for symbol in bad_round.iter().take(10) {
         println!("  {symbol}");
     }

@@ -174,11 +174,14 @@ async fn a_rate_limited_page_is_asked_for_again() {
 type ServerWs = WebSocketStream<TcpStream>;
 
 async fn next_command(ws: &mut ServerWs) -> Value {
-    loop {
-        if let Message::Text(text) = ws.next().await.unwrap().unwrap() {
-            return serde_json::from_str(text.as_str()).unwrap();
+    let reading = async {
+        loop {
+            if let Message::Text(text) = ws.next().await.unwrap().unwrap() {
+                return serde_json::from_str(text.as_str()).unwrap();
+            }
         }
-    }
+    };
+    tokio::time::timeout(Duration::from_secs(5), reading).await.expect("a command should arrive")
 }
 
 async fn send(ws: &mut ServerWs, json: Value) {
@@ -271,7 +274,7 @@ fn summarize(event: Event) -> String {
 
 #[tokio::test]
 async fn stays_in_sync_with_a_mock_kalshi() {
-    let (mut kalshi, events, rest, websocket) = against_mocks().await;
+    let (mut kalshi, events, rest, websocket) = against_mocks(1).await;
     tokio::spawn(mock_rest(rest));
     let script = tokio::spawn(mock_websocket(websocket));
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -323,12 +326,13 @@ async fn stays_in_sync_with_a_mock_kalshi() {
 }
 
 /// A `Kalshi` pointed at mocks on localhost, and the two listeners.
-async fn against_mocks() -> (Kalshi, Receiver<Event>, TcpListener, TcpListener) {
+async fn against_mocks(connections: usize) -> (Kalshi, Receiver<Event>, TcpListener, TcpListener) {
     let rest = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let websocket = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut config = KalshiConfig::demo();
     config.rest_url = format!("http://{}/trade-api/v2", rest.local_addr().unwrap());
     config.ws_url = format!("ws://{}/trade-api/ws/v2", websocket.local_addr().unwrap());
+    config.connections = connections;
     let (kalshi, events) = Kalshi::new(config).unwrap();
     (kalshi, events, rest, websocket)
 }
@@ -340,7 +344,7 @@ async fn accept(listener: &TcpListener) -> ServerWs {
 
 #[tokio::test]
 async fn a_lost_connection_is_reopened_and_resubscribed() {
-    let (mut kalshi, events, rest, websocket) = against_mocks().await;
+    let (mut kalshi, events, rest, websocket) = against_mocks(1).await;
     tokio::spawn(mock_rest(rest));
     let script = tokio::spawn(async move {
         let mut ws = accept(&websocket).await;
@@ -396,7 +400,7 @@ async fn a_lost_connection_is_reopened_and_resubscribed() {
 
 #[tokio::test]
 async fn many_symbols_are_subscribed_in_batches_in_order() {
-    let (mut kalshi, _events, rest, websocket) = against_mocks().await;
+    let (mut kalshi, _events, rest, websocket) = against_mocks(1).await;
     let tickers: Vec<String> = (0..1200).map(|n| format!("M{n:04}")).collect();
     tokio::spawn(serve_markets(rest, tickers.clone()));
     let script = tokio::spawn(async move {
@@ -421,7 +425,7 @@ async fn many_symbols_are_subscribed_in_batches_in_order() {
 /// waiting to be sent. Messages it sends must still be read and acted on.
 #[tokio::test]
 async fn unsent_commands_do_not_stop_messages_being_read() {
-    let (mut kalshi, events, rest, websocket) = against_mocks().await;
+    let (mut kalshi, events, rest, websocket) = against_mocks(1).await;
     // Long tickers: about 18 MB of subscribe commands, more than the socket
     // buffers between the two ends can hold.
     let tickers: Vec<String> = (0..60_000).map(|n| format!("M{n:05}-{}", "X".repeat(290))).collect();
@@ -460,6 +464,155 @@ async fn unsent_commands_do_not_stop_messages_being_read() {
         .expect("a message must be read even though commands are still unsent");
     client.abort();
     server.abort();
+}
+
+/// Two mock sockets that have both been subscribed to A and B and have
+/// each sent their snapshots, plus what the service has published so far.
+/// The sockets send different quantities (20 and 30, or 21 and 31), so what
+/// is published shows which socket the service is using as its source.
+struct Pair {
+    source: ServerWs,
+    standby: ServerWs,
+    /// The quantities the standby sent for A and B, in contracts.
+    standby_sent: (i64, i64),
+    events: Receiver<Event>,
+    seen: Vec<String>,
+}
+
+impl Pair {
+    async fn start(events: Receiver<Event>, websocket: &TcpListener) -> Self {
+        let mut sockets = [accept(websocket).await, accept(websocket).await];
+        for (ws, extra) in sockets.iter_mut().zip([0, 1]) {
+            assert_eq!(next_command(ws).await["params"]["channels"], json!(["market_lifecycle_v2"]));
+            assert_eq!(next_command(ws).await["params"]["market_tickers"], json!(["A", "B"]));
+            send(ws, snapshot(1, "A", 100, &format!("{}.00", 20 + extra))).await;
+            send(ws, snapshot(2, "B", 100, &format!("{}.00", 30 + extra))).await;
+        }
+        let mut pair = {
+            let [first, second] = sockets;
+            Pair { source: first, standby: second, standby_sent: (21, 31), events, seen: Vec::new() }
+        };
+        pair.wait_for(4).await;
+        pair.seen[..2].sort();
+        assert_eq!(pair.seen[..2], ["+A", "+B"]);
+        if pair.seen[2] == snapshot_event("A", 21) {
+            std::mem::swap(&mut pair.source, &mut pair.standby);
+            pair.standby_sent = (20, 30);
+        }
+        let (a, b) = pair.standby_sent;
+        let source_sent = (41 - a, 61 - b);
+        assert_eq!(pair.seen[2..], [snapshot_event("A", source_sent.0), snapshot_event("B", source_sent.1)]);
+        pair
+    }
+
+    /// Waits until `count` events have been published in total.
+    async fn wait_for(&mut self, count: usize) {
+        let collecting = async {
+            while self.seen.len() < count {
+                self.seen.extend(self.events.try_iter().map(summarize));
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        if tokio::time::timeout(Duration::from_secs(5), collecting).await.is_err() {
+            panic!("expected {count} events, got {:?}", self.seen);
+        }
+    }
+}
+
+fn snapshot_event(symbol: &str, contracts: i64) -> String {
+    format!("snapshot {symbol} bids=[(400000, {})] asks=[(420000, 10000000)]", contracts * ONE)
+}
+
+#[tokio::test]
+async fn the_standby_takes_over_when_the_source_is_cut() {
+    let (mut kalshi, events, rest, websocket) = against_mocks(2).await;
+    tokio::spawn(mock_rest(rest));
+    let (cut, cuts) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let cuts = Box::pin(futures_util::stream::unfold(cuts, |mut cuts| async move {
+        cuts.recv().await.map(|()| ((), cuts))
+    }));
+    let client = tokio::spawn(async move { kalshi.run_with_faults(std::future::pending(), cuts).await });
+    let mut pair = Pair::start(events, &websocket).await;
+    let (a, b) = pair.standby_sent;
+
+    cut.send(()).unwrap();
+    // The source's socket ends without a closing handshake.
+    let ending = async { while let Some(Ok(_)) = pair.source.next().await {} };
+    tokio::time::timeout(Duration::from_secs(5), ending).await.expect("the source should be cut");
+
+    // Every book the standby holds is published, then its changes follow.
+    pair.wait_for(6).await;
+    send(&mut pair.standby, delta(3, "A", 101, "-5.00")).await;
+    pair.wait_for(7).await;
+    // Lifecycle messages are now taken from the standby too.
+    send(&mut pair.standby, lifecycle(1, "B", "settled")).await;
+    assert_eq!(next_command(&mut pair.standby).await["params"]["action"], "delete_markets");
+    pair.wait_for(8).await;
+    assert_eq!(
+        pair.seen[4..],
+        [
+            snapshot_event("A", a),
+            snapshot_event("B", b),
+            format!("level A Buy 400000 {}", (a - 5) * ONE),
+            "-B".to_owned(),
+        ]
+    );
+
+    // The cut connection comes back, catches up quietly, and is ready to
+    // take over in its turn.
+    let mut returned = accept(&websocket).await;
+    assert_eq!(next_command(&mut returned).await["params"]["channels"], json!(["market_lifecycle_v2"]));
+    assert_eq!(next_command(&mut returned).await["params"]["market_tickers"], json!(["A"]));
+    send(&mut returned, snapshot(1, "A", 105, "40.00")).await;
+    cut.send(()).unwrap();
+    // Its book is published once it has loaded and the other socket is gone.
+    // (REST is asked again too, and the mock still lists B, so "+B" may
+    // come before or after it.)
+    while !pair.seen[8..].contains(&snapshot_event("A", 40)) {
+        pair.wait_for(pair.seen.len() + 1).await;
+    }
+    client.abort();
+}
+
+#[tokio::test]
+async fn the_standby_takes_over_when_the_source_misses_a_message() {
+    let (mut kalshi, events, rest, websocket) = against_mocks(2).await;
+    tokio::spawn(mock_rest(rest));
+    let client = tokio::spawn(async move { kalshi.run(std::future::pending()).await });
+    let mut pair = Pair::start(events, &websocket).await;
+    let (a, b) = pair.standby_sent;
+
+    // seq 3 never arrives on the source.
+    send(&mut pair.source, delta(4, "A", 102, "-1.00")).await;
+    pair.wait_for(6).await;
+
+    // The old source re-fetches its books, but none of that is published.
+    let command = next_command(&mut pair.source).await;
+    assert_eq!(command["params"]["action"], "get_snapshot");
+    assert_eq!(command["params"]["market_tickers"], json!(["A", "B"]));
+    send(&mut pair.source, snapshot(5, "A", 102, "50.00")).await;
+    send(&mut pair.source, snapshot(6, "B", 102, "60.00")).await;
+    send(&mut pair.source, delta(7, "A", 103, "1.00")).await;
+
+    send(&mut pair.standby, delta(3, "A", 101, "-5.00")).await;
+    pair.wait_for(7).await;
+    // Kalshi sends lifecycle messages on both sockets; one of them counts.
+    // Both sockets being told to unsubscribe shows both handled all of the above.
+    send(&mut pair.source, lifecycle(1, "B", "settled")).await;
+    send(&mut pair.standby, lifecycle(1, "B", "settled")).await;
+    assert_eq!(next_command(&mut pair.source).await["params"]["action"], "delete_markets");
+    assert_eq!(next_command(&mut pair.standby).await["params"]["action"], "delete_markets");
+    pair.wait_for(8).await;
+    assert_eq!(
+        pair.seen[4..],
+        [
+            snapshot_event("A", a),
+            snapshot_event("B", b),
+            format!("level A Buy 400000 {}", (a - 5) * ONE),
+            "-B".to_owned(),
+        ]
+    );
+    client.abort();
 }
 
 /// Live check against the demo environment; needs network, no API key.
