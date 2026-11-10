@@ -330,12 +330,19 @@ async fn stays_in_sync_with_a_mock_kalshi() {
 
 /// A `Kalshi` pointed at mocks on localhost, and the two listeners.
 async fn against_mocks(connections: usize) -> (Kalshi, Receiver<Event>, TcpListener, TcpListener) {
+    against_mocks_with(|config| config.connections = connections).await
+}
+
+async fn against_mocks_with(
+    adjust: impl FnOnce(&mut KalshiConfig),
+) -> (Kalshi, Receiver<Event>, TcpListener, TcpListener) {
     let rest = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let websocket = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut config = KalshiConfig::demo();
     config.rest_url = format!("http://{}/trade-api/v2", rest.local_addr().unwrap());
     config.ws_url = format!("ws://{}/trade-api/ws/v2", websocket.local_addr().unwrap());
-    config.connections = connections;
+    config.connections = 1;
+    adjust(&mut config);
     let (kalshi, events) = Kalshi::new(config).unwrap();
     (kalshi, events, rest, websocket)
 }
@@ -618,6 +625,176 @@ async fn the_standby_takes_over_when_the_source_misses_a_message() {
         ]
     );
     client.abort();
+}
+
+/// Waits for a mock socket to be hung up on.
+async fn expect_hang_up(ws: &mut ServerWs) {
+    let ending = async { while let Some(Ok(_)) = ws.next().await {} };
+    tokio::time::timeout(Duration::from_secs(5), ending).await.expect("the service should hang up");
+}
+
+fn now_ms() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
+#[tokio::test]
+async fn a_quiet_source_is_cut_and_the_standby_takes_over() {
+    let (mut kalshi, events, rest, websocket) = against_mocks_with(|config| {
+        config.connections = 2;
+        config.health.check_every = Duration::from_millis(20);
+        config.health.quiet_after = Duration::from_millis(200);
+    })
+    .await;
+    tokio::spawn(mock_rest(rest));
+    let client = tokio::spawn(async move { kalshi.run(std::future::pending()).await });
+    let mut pair = Pair::start(events, &websocket).await;
+    let (a, b) = pair.standby_sent;
+
+    // The source's socket stays open but says nothing more, while the
+    // standby hears a change.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    send(&mut pair.standby, delta(3, "A", 101, "-5.00")).await;
+
+    expect_hang_up(&mut pair.source).await;
+    pair.wait_for(6).await;
+    assert_eq!(pair.seen[4..], [snapshot_event("A", a - 5), snapshot_event("B", b)]);
+    client.abort();
+}
+
+#[tokio::test]
+async fn a_lagging_source_hands_over_but_stays_connected() {
+    let (mut kalshi, events, rest, websocket) = against_mocks_with(|config| {
+        config.connections = 2;
+        config.health.check_every = Duration::from_millis(50);
+        config.health.lag_dwell = Duration::ZERO;
+    })
+    .await;
+    tokio::spawn(mock_rest(rest));
+    let client = tokio::spawn(async move { kalshi.run(std::future::pending()).await });
+    let mut pair = Pair::start(events, &websocket).await;
+    let (_, b) = pair.standby_sent;
+
+    // Both sockets carry the same changes, but the source's were queued by
+    // Kalshi two seconds before they arrive.
+    let timed = |seq: u64, sent_ms: i64| {
+        let mut message = delta(seq, "A", 98 + seq as i64, "-0.01");
+        message["sending_ts_ms"] = json!(sent_ms);
+        message
+    };
+    for seq in 3..40 {
+        send(&mut pair.source, timed(seq, now_ms() - 2_000)).await;
+        send(&mut pair.standby, timed(seq, now_ms())).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // B never changed, so its snapshot tells the two sockets apart.
+    while !pair.seen[4..].contains(&snapshot_event("B", b)) {
+        pair.wait_for(pair.seen.len() + 1).await;
+    }
+    let still_open = tokio::time::timeout(Duration::from_millis(200), pair.source.next()).await;
+    assert!(still_open.is_err(), "a lagging connection is kept as the standby, got {still_open:?}");
+    client.abort();
+}
+
+#[tokio::test]
+async fn a_socket_with_no_pings_is_dead() {
+    let (mut kalshi, _events, rest, websocket) =
+        against_mocks_with(|config| config.health.dead_after = Duration::from_millis(300)).await;
+    tokio::spawn(mock_rest(rest));
+    let client = tokio::spawn(async move { kalshi.run(std::future::pending()).await });
+
+    // This mock never sends pings, as a dead line would not.
+    let mut ws = accept(&websocket).await;
+    assert_eq!(next_command(&mut ws).await["params"]["channels"], json!(["market_lifecycle_v2"]));
+    expect_hang_up(&mut ws).await;
+    let reconnected = tokio::time::timeout(Duration::from_secs(5), accept(&websocket)).await;
+    assert!(reconnected.is_ok(), "the service should connect again");
+    client.abort();
+}
+
+#[tokio::test]
+async fn a_lone_connection_that_falls_silent_reconnects() {
+    let (mut kalshi, _events, rest, websocket) = against_mocks_with(|config| {
+        config.health.check_every = Duration::from_millis(20);
+        config.health.silence_floor = Duration::from_millis(300);
+        config.health.silence_factor = 10;
+    })
+    .await;
+    tokio::spawn(mock_rest(rest));
+    let client = tokio::spawn(async move { kalshi.run(std::future::pending()).await });
+
+    let mut ws = accept(&websocket).await;
+    assert_eq!(next_command(&mut ws).await["params"]["channels"], json!(["market_lifecycle_v2"]));
+    assert_eq!(next_command(&mut ws).await["params"]["market_tickers"], json!(["A", "B"]));
+    send(&mut ws, snapshot(1, "A", 100, "90.00")).await;
+    send(&mut ws, snapshot(2, "B", 100, "30.00")).await;
+    // Enough changes, close together, to learn that this market is busy...
+    for seq in 3..30 {
+        send(&mut ws, delta(seq, "A", 98 + seq as i64, "-1.00")).await;
+    }
+    // ...then nothing. There is no second connection to compare with, so
+    // the long silence itself is the signal.
+    expect_hang_up(&mut ws).await;
+    client.abort();
+}
+
+#[tokio::test]
+async fn symbols_are_divided_between_groups_by_event() {
+    let (mut kalshi, events, rest, websocket) = against_mocks_with(|config| config.groups = 2).await;
+    let tickers: Vec<String> =
+        (0..20).flat_map(|event| (0..3).map(move |market| format!("S-E{event:02}-M{market}"))).collect();
+    tokio::spawn(serve_markets(rest, tickers.clone()));
+    let client = tokio::spawn(async move { kalshi.run(std::future::pending()).await });
+
+    let mut asked: Vec<Vec<String>> = Vec::new();
+    let mut sockets = [accept(&websocket).await, accept(&websocket).await];
+    for ws in &mut sockets {
+        assert_eq!(next_command(ws).await["params"]["channels"], json!(["market_lifecycle_v2"]));
+        let command = next_command(ws).await;
+        let batch = command["params"]["market_tickers"].as_array().unwrap();
+        asked.push(batch.iter().map(|ticker| ticker.as_str().unwrap().to_owned()).collect());
+    }
+    let mut all: Vec<String> = asked.concat();
+    all.sort();
+    assert_eq!(all, tickers, "every symbol is followed, by exactly one group");
+    assert!(asked.iter().all(|group| !group.is_empty()));
+    let event = |ticker: &String| ticker.rsplit_once('-').unwrap().0.to_owned();
+    let events_of = |group: &Vec<String>| group.iter().map(event).collect::<HashSet<String>>();
+    assert!(events_of(&asked[0]).is_disjoint(&events_of(&asked[1])), "an event's markets stay together");
+
+    // Each group has its own source, and both are published.
+    for (ws, group) in sockets.iter_mut().zip(&asked) {
+        send(ws, snapshot(1, &group[0], 100, "20.00")).await;
+    }
+    let wanted = [snapshot_event(&asked[0][0], 20), snapshot_event(&asked[1][0], 20)];
+    let published = async {
+        let mut seen: Vec<String> = Vec::new();
+        while !wanted.iter().all(|event| seen.contains(event)) {
+            seen.extend(events.try_iter().map(summarize));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), published).await.expect("both groups should publish");
+    client.abort();
+}
+
+#[test]
+fn groups_are_stable_and_roughly_even() {
+    assert_eq!(group_for("KXBTCD-26NOV1017-T1", 8), group_for("KXBTCD-26NOV1017-T99999.99", 8));
+    assert_eq!(group_for("ANYTHING", 1), 0);
+    let mut sizes = [0usize; 8];
+    for event in 0..8_000 {
+        sizes[group_for(&format!("KXSERIES-26NOV{event:04}-T1"), 8)] += 1;
+    }
+    assert!(sizes.iter().all(|size| (800..1_200).contains(size)), "{sizes:?}");
+}
+
+#[test]
+fn the_status_line_can_be_printed_before_anything_is_connected() {
+    let mut config = KalshiConfig::demo();
+    config.groups = 3;
+    let (mut kalshi, _events) = Kalshi::new(config).unwrap();
+    kalshi.print_status();
+    kalshi.check_health();
 }
 
 /// Live check against the demo environment; needs network, no API key.

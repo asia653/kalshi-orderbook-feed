@@ -102,9 +102,56 @@ pub struct KalshiConfig {
     pub reconcile_interval: Duration,
     /// How often every book is published in full.
     pub snapshot_interval: Duration,
-    /// How many WebSockets follow the symbols. One is the source; the rest
+    /// How many WebSockets follow each symbol. One is the source; the rest
     /// are ready to take over from it.
     pub connections: usize,
+    /// How many groups the symbols are divided into. Each group has its own
+    /// `connections` WebSockets, so the total is `groups * connections`.
+    /// More groups means less traffic on each socket.
+    pub groups: usize,
+    pub health: Health,
+    /// How often a status line goes to stderr. `None` for never.
+    pub status_interval: Option<Duration>,
+}
+
+/// When a connection counts as unhealthy.
+#[derive(Debug, Clone)]
+pub struct Health {
+    /// How often the connections are compared.
+    pub check_every: Duration,
+    /// A socket on which nothing arrives for this long, not even one of
+    /// Kalshi's 10-second pings, is dead.
+    pub dead_after: Duration,
+    /// A connection that has heard nothing for this long, while another
+    /// connection following the same symbols heard a delta, has a quiet
+    /// subscription.
+    pub quiet_after: Duration,
+    /// With nothing to compare against: a connection is silent when it has
+    /// heard nothing for `silence_factor` times its usual gap between
+    /// deltas, and for at least `silence_floor`.
+    pub silence_floor: Duration,
+    pub silence_factor: u32,
+    /// The source is lagging when its messages are this much more delayed
+    /// than another connection's, for `lag_checks` checks in a row.
+    pub lag_margin: Duration,
+    pub lag_checks: u32,
+    /// After a switch for lag, how long before another is considered.
+    pub lag_dwell: Duration,
+}
+
+impl Default for Health {
+    fn default() -> Self {
+        Self {
+            check_every: Duration::from_secs(1),
+            dead_after: Duration::from_secs(25),
+            quiet_after: Duration::from_secs(3),
+            silence_floor: Duration::from_secs(30),
+            silence_factor: 100,
+            lag_margin: Duration::from_millis(500),
+            lag_checks: 3,
+            lag_dwell: Duration::from_secs(10),
+        }
+    }
 }
 
 impl KalshiConfig {
@@ -125,13 +172,20 @@ impl KalshiConfig {
             reconcile_interval: Duration::from_secs(300),
             snapshot_interval: Duration::from_secs(60),
             connections: 2,
+            groups: 1,
+            health: Health::default(),
+            status_interval: None,
         }
     }
 
-    /// Reads `KALSHI_ENV` (`demo` by default, or `prod`), `KALSHI_API_KEY_ID`,
-    /// `KALSHI_PRIVATE_KEY_PATH` and optionally `KALSHI_SERIES_TICKER` and
-    /// `KALSHI_CONNECTIONS` (2 by default). `KALSHI_REST_URL` and
-    /// `KALSHI_WS_URL` override the environment's URLs.
+    /// Reads `KALSHI_ENV` (`demo` by default, or `prod`), `KALSHI_API_KEY_ID`
+    /// and `KALSHI_PRIVATE_KEY_PATH`. Optional:
+    ///
+    /// * `KALSHI_SERIES_TICKER`: only follow this series.
+    /// * `KALSHI_CONNECTIONS` (2) and `KALSHI_GROUPS` (1): see the fields.
+    /// * `KALSHI_STATUS_SECONDS` (5): how often to print a status line; 0
+    ///   for never.
+    /// * `KALSHI_REST_URL` and `KALSHI_WS_URL`: override the environment's.
     pub fn from_env() -> anyhow::Result<Self> {
         let mut config = match std::env::var("KALSHI_ENV").as_deref() {
             Ok("prod") => Self::prod(),
@@ -145,9 +199,22 @@ impl KalshiConfig {
             .with_context(|| format!("reading private key at {key_path}"))?;
         config.credentials = Some((key_id, pem));
         config.series_ticker = std::env::var("KALSHI_SERIES_TICKER").ok();
-        if let Ok(connections) = std::env::var("KALSHI_CONNECTIONS") {
-            config.connections = connections.parse().context("KALSHI_CONNECTIONS must be a number")?;
+        let number = |name: &str| -> anyhow::Result<Option<u64>> {
+            match std::env::var(name) {
+                Ok(text) => Ok(Some(text.parse().with_context(|| format!("{name} must be a number"))?)),
+                Err(_) => Ok(None),
+            }
+        };
+        if let Some(connections) = number("KALSHI_CONNECTIONS")? {
+            config.connections = connections as usize;
         }
+        if let Some(groups) = number("KALSHI_GROUPS")? {
+            config.groups = groups as usize;
+        }
+        config.status_interval = match number("KALSHI_STATUS_SECONDS")? {
+            Some(0) => None,
+            seconds => Some(Duration::from_secs(seconds.unwrap_or(5))),
+        };
         if let Ok(url) = std::env::var("KALSHI_REST_URL") {
             config.rest_url = url;
         }
@@ -175,16 +242,44 @@ pub struct Kalshi {
     /// When every book is next published in full.
     next_snapshot: tokio::time::Instant,
 
+    /// Every connection, group after group: group `g` has the connections
+    /// from `g * config.connections` up to the next group's first.
     connections: Vec<Connection>,
-    /// The connection whose books are published.
-    source: usize,
+    /// For each group, the connection whose books are published.
+    sources: Vec<usize>,
+    /// For each group, how the source's delay compares with the others'.
+    lagging: Vec<Lagging>,
     /// The connection whose lifecycle messages are applied. It only needs
-    /// to be open, so it can differ from the source.
+    /// to be open, and can be in any group: lifecycle messages are the same
+    /// on every socket.
     lead: usize,
     /// Which connection is asked first for news, so none is starved.
     turn: usize,
+    /// Events published since the last status line.
+    published: u64,
     /// Message types we do not handle and have already logged once.
     unhandled: HashSet<String>,
+}
+
+struct Lagging {
+    /// Health checks in a row that found the source lagging.
+    checks: u32,
+    /// When the source was last changed because of lag.
+    switched_at: Option<tokio::time::Instant>,
+}
+
+/// Which group follows `symbol`. All markets of one event land in the same
+/// group, and a market always lands in the same group, so symbols coming
+/// and going never move the others around.
+fn group_for(symbol: &str, groups: usize) -> usize {
+    // A market ticker is its event's ticker plus a last part: the event of
+    // `KXBTCD-26NOV1017-T75749.99` is `KXBTCD-26NOV1017`.
+    let event = symbol.rsplit_once('-').map_or(symbol, |(event, _)| event);
+    // FNV-1a: small, and the same on every run and every machine.
+    let hash = event.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    (hash % groups as u64) as usize
 }
 
 impl Kalshi {
@@ -210,11 +305,18 @@ impl Kalshi {
         let (events, events_rx) = unbounded();
         let symbols = Synced::new(SymbolList::new(config.series_ticker.clone()));
         let next_snapshot = tokio::time::Instant::now() + config.snapshot_interval;
+
         anyhow::ensure!(config.connections >= 1, "at least one connection is needed");
-        let mut connections: Vec<Connection> = (0..config.connections)
-            .map(|id| Connection::new(id, config.ws_url.clone(), auth.clone()))
+        anyhow::ensure!(config.groups >= 1, "at least one group is needed");
+        let mut connections: Vec<Connection> = (0..config.groups * config.connections)
+            .map(|id| Connection::new(id, config.ws_url.clone(), auth.clone(), config.health.dead_after))
             .collect();
-        connections[0].set_reporting(true);
+        // Each group starts with its first connection as the source.
+        let sources: Vec<usize> = (0..config.groups).map(|group| group * config.connections).collect();
+        for &source in &sources {
+            connections[source].set_reporting(true);
+        }
+        let lagging = (0..config.groups).map(|_| Lagging { checks: 0, switched_at: None }).collect();
         let kalshi = Self {
             config,
             auth,
@@ -226,9 +328,11 @@ impl Kalshi {
             fetch: None,
             next_snapshot,
             connections,
-            source: 0,
+            sources,
+            lagging,
             lead: 0,
             turn: 0,
+            published: 0,
             unhandled: HashSet::new(),
         };
         Ok((kalshi, events_rx))
@@ -245,9 +349,9 @@ impl Kalshi {
         self.run_with_faults(shutdown, futures_util::stream::pending()).await
     }
 
-    /// Like [`Kalshi::run`], and every item of `drop_source` cuts the
-    /// source's socket as a network failure would. For seeing a switch of
-    /// source happen on demand.
+    /// Like [`Kalshi::run`], and every item of `drop_source` cuts a source's
+    /// socket as a network failure would. For seeing a switch of source
+    /// happen on demand.
     pub async fn run_with_faults(
         &mut self,
         shutdown: impl Future<Output = ()>,
@@ -258,6 +362,11 @@ impl Kalshi {
         tokio::pin!(shutdown);
         let mut reconcile = tokio::time::interval(self.config.reconcile_interval);
         reconcile.tick().await; // the first tick fires immediately
+        let mut health = tokio::time::interval(self.config.health.check_every);
+        health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let showing = self.config.status_interval.is_some();
+        let mut status = tokio::time::interval(self.config.status_interval.unwrap_or(Duration::MAX));
+        status.tick().await;
         loop {
             let until_close = self.symbols.state().until_next_close(Utc::now().timestamp());
             let next_snapshot = self.next_snapshot;
@@ -268,8 +377,10 @@ impl Kalshi {
                 _ = &mut shutdown => break,
                 (index, heard) = next_heard(connections, self.turn) => self.on_heard(index, heard),
                 Some(()) = drop_source.next() => {
-                    eprintln!("kalshi: dropping connection {} on request", self.source);
-                    self.connections[self.source].drop_socket("dropped on request");
+                    // The first group's source: one cut is enough to watch.
+                    let source = self.sources[0];
+                    eprintln!("kalshi: dropping connection {source} on request");
+                    self.connections[source].drop_socket("dropped on request");
                 }
                 open = async { fetch.as_mut().expect("guarded").await }, if fetching => {
                     self.fetch = None;
@@ -286,6 +397,8 @@ impl Kalshi {
                 }
                 _ = reconcile.tick() => self.symbols_stale = true,
                 _ = tokio::time::sleep_until(next_snapshot) => self.publish_snapshots(),
+                _ = health.tick() => self.check_health(),
+                _ = status.tick(), if showing => self.print_status(),
             }
             // Listen before fetching: lifecycle messages that arrive while
             // REST is paging are held by `self.symbols` and replayed after
@@ -297,13 +410,31 @@ impl Kalshi {
         futures_util::future::join_all(self.connections.iter_mut().map(Connection::close)).await;
     }
 
+    // ---- groups -----------------------------------------------------------
+
+    fn group_of(&self, connection: usize) -> usize {
+        connection / self.config.connections
+    }
+
+    /// The connections of `group`.
+    fn members(&self, group: usize) -> std::ops::Range<usize> {
+        group * self.config.connections..(group + 1) * self.config.connections
+    }
+
     // ---- reacting ---------------------------------------------------------
 
     fn on_heard(&mut self, index: usize, heard: Heard) {
+        let group = self.group_of(index);
         match heard {
             Heard::Opened => {
-                // A new socket has no subscriptions: follow every current symbol.
-                let following = self.symbols();
+                // A new socket has no subscriptions: follow every current
+                // symbol of its group.
+                let groups = self.config.groups;
+                let following: Vec<String> = self
+                    .symbols()
+                    .into_iter()
+                    .filter(|symbol| group_for(symbol, groups) == group)
+                    .collect();
                 let connection = &mut self.connections[index];
                 connection.subscribe_lifecycle();
                 connection.follow_all(following);
@@ -317,9 +448,9 @@ impl Kalshi {
                     let open = (0..self.connections.len()).find(|&i| self.connections[i].is_open());
                     self.follow_lead(open.unwrap_or(index));
                 }
-                self.choose_source();
+                self.choose_source(group);
             }
-            Heard::InSync | Heard::OutOfSync => self.choose_source(),
+            Heard::InSync | Heard::OutOfSync => self.choose_source(group),
             // Only the lead's lifecycle messages count. Mixing two streams
             // would let a slow one undo what the other has already said.
             Heard::Missed if index == self.lead => self.symbols_stale = true,
@@ -333,7 +464,7 @@ impl Kalshi {
             Heard::Missed | Heard::Lifecycle(_) => {}
             // A connection that has just stopped being the source may still
             // have changes queued; they are no longer wanted.
-            Heard::Book(event) if index == self.source => self.publish(event),
+            Heard::Book(event) if index == self.sources[group] => self.publish(event),
             Heard::Book(_) => {}
             Heard::Unhandled { kind, raw } => {
                 if self.unhandled.insert(kind.clone()) {
@@ -353,31 +484,45 @@ impl Kalshi {
         self.symbols_stale = true;
     }
 
-    /// Keeps the source if its books can be trusted. Otherwise moves to a
-    /// connection whose books can, if there is one, and publishes all of
-    /// its books: the two connections may have seen different things, and a
-    /// full snapshot of each book replaces whatever the old source said.
-    fn choose_source(&mut self) {
-        if self.connections[self.source].in_sync() {
+    /// Keeps `group`'s source if its books can be trusted. Otherwise moves
+    /// to a connection of the group whose books can, if there is one.
+    fn choose_source(&mut self, group: usize) {
+        if self.connections[self.sources[group]].in_sync() {
             return;
         }
-        let Some(next) = (0..self.connections.len()).find(|&i| self.connections[i].in_sync()) else {
-            // Nobody is better. The source catches up by itself, publishing
-            // each book's fresh snapshot as it arrives.
-            return;
-        };
-        eprintln!("kalshi: the source is now connection {next} (was {})", self.source);
-        self.connections[self.source].set_reporting(false);
-        self.connections[next].set_reporting(true);
-        self.source = next;
-        self.publish_books();
+        // If nobody is better, the source catches up by itself, publishing
+        // each book's fresh snapshot as it arrives.
+        if let Some(next) = self.members(group).find(|&i| self.connections[i].in_sync()) {
+            self.switch_source(group, next);
+        }
     }
 
-    /// Passes changes to the symbol list on to every connection, and
-    /// publishes them.
+    /// Makes `next` the source of `group` and publishes all of its books:
+    /// the two connections may have seen different things, and a full
+    /// snapshot of each book replaces whatever the old source said.
+    fn switch_source(&mut self, group: usize, next: usize) {
+        let old = std::mem::replace(&mut self.sources[group], next);
+        eprintln!("kalshi: the source is now connection {next} (was {old})");
+        self.connections[old].set_reporting(false);
+        self.connections[next].set_reporting(true);
+        self.lagging[group].checks = 0;
+        let mut books = self.books_of(next, Utc::now());
+        books.sort_by(|a, b| a.0.cmp(&b.0));
+        for (_, event) in books {
+            self.publish(event);
+        }
+    }
+
+    /// Passes changes to the symbol list on to the connections of each
+    /// symbol's group, and publishes them.
     fn on_symbol_changes(&mut self, changes: Vec<SymbolChange>) {
-        for connection in &mut self.connections {
-            connection.on_symbol_changes(&changes);
+        let mut by_group: Vec<Vec<SymbolChange>> = vec![Vec::new(); self.config.groups];
+        for change in &changes {
+            let (SymbolChange::Added(symbol) | SymbolChange::Removed(symbol)) = change;
+            by_group[group_for(symbol, self.config.groups)].push(change.clone());
+        }
+        for (index, connection) in self.connections.iter_mut().enumerate() {
+            connection.on_symbol_changes(&by_group[index / self.config.connections]);
         }
         for change in changes {
             self.publish(Event::Symbol(change));
@@ -402,15 +547,155 @@ impl Kalshi {
         ))
     }
 
+    // ---- health -----------------------------------------------------------
+
+    /// Compares the connections of each group with each other. Run every
+    /// [`Health::check_every`].
+    fn check_health(&mut self) {
+        let health = self.config.health.clone();
+        let now = tokio::time::Instant::now();
+        for group in 0..self.config.groups {
+            let members = self.members(group);
+
+            // A subscription that has stopped delivering. The connection is
+            // cut and connects again; if it was the source, losing it makes
+            // another connection the source.
+            for index in members.clone() {
+                let others = members.clone().filter(|&other| other != index);
+                let heard_elsewhere =
+                    others.clone().filter_map(|other| self.connections[other].vitals.last_delta_at).max();
+                let others_ready = others.clone().all(|other| self.connections[other].in_sync());
+                let connection = &mut self.connections[index];
+                if !connection.in_sync() {
+                    connection.strikes = 0;
+                    continue;
+                }
+                let last = connection.vitals.last_book_at;
+                let quiet = heard_elsewhere.is_some_and(|heard| heard > last + health.quiet_after);
+                // With nothing to compare against, go by this connection's
+                // own habits. Not while another connection is itself
+                // recovering: they take turns, so the feed is never dropped
+                // everywhere at once.
+                let silent = others_ready
+                    && connection.vitals.usual_gap().is_some_and(|gap| {
+                        now - last > health.silence_floor.max(gap * health.silence_factor)
+                    });
+                if !quiet && !silent {
+                    connection.strikes = 0;
+                    continue;
+                }
+                // Twice in a row, so a message we were merely late to read
+                // is not taken for one that never came.
+                connection.strikes += 1;
+                if connection.strikes >= 2 {
+                    let silence = now - last;
+                    connection.drop_socket(&if quiet {
+                        format!("quiet subscription: nothing for {silence:.1?} while another connection heard deltas")
+                    } else {
+                        format!("silent subscription: nothing for {silence:.1?}, far longer than usual")
+                    });
+                }
+            }
+
+            // A source that delivers late. It stays connected, as the
+            // standby: being late is not being wrong.
+            let source = self.sources[group];
+            let lags: Vec<(usize, f64)> = members
+                .clone()
+                .filter_map(|index| {
+                    let connection = &mut self.connections[index];
+                    // Taken either way, so what a connection saw while
+                    // catching up is not counted against it afterwards.
+                    let lag = connection.vitals.take_recent_lag();
+                    connection.in_sync().then_some((index, lag?))
+                })
+                .collect();
+            let source_lag = lags.iter().find(|(index, _)| *index == source).map(|(_, lag)| *lag);
+            let fastest = lags
+                .iter()
+                .filter(|(index, _)| *index != source)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .copied();
+            let margin = health.lag_margin.as_secs_f64() * 1000.0;
+            let lagging = &mut self.lagging[group];
+            match (source_lag, fastest) {
+                (Some(source_lag), Some((fastest, lag))) if source_lag - lag > margin => {
+                    lagging.checks += 1;
+                    let settled = lagging.switched_at.is_none_or(|at| now - at >= health.lag_dwell);
+                    if lagging.checks >= health.lag_checks && settled {
+                        eprintln!(
+                            "kalshi[{source}]: lagging: {source_lag:.0} ms behind Kalshi against {lag:.0} ms on connection {fastest}"
+                        );
+                        lagging.switched_at = Some(now);
+                        self.switch_source(group, fastest);
+                    }
+                }
+                // No verdict without numbers from both sides.
+                (Some(_), Some(_)) => lagging.checks = 0,
+                _ => {}
+            }
+        }
+    }
+
+    /// One line on stderr: what is followed, what is written, and how each
+    /// connection is doing.
+    fn print_status(&mut self) {
+        let seconds = self.config.status_interval.map_or(1.0, |interval| interval.as_secs_f64());
+        let mut line = format!(
+            "kalshi: {} symbols, {:.0} events/s written",
+            self.symbols.state().symbols().len(),
+            std::mem::take(&mut self.published) as f64 / seconds,
+        );
+        let detailed = self.connections.len() <= 4;
+        let (mut healthy, mut messages, mut lag_sum, mut lag_max) = (0usize, 0u64, 0.0f64, f64::MIN);
+        for index in 0..self.connections.len() {
+            let role = if self.sources[self.group_of(index)] == index { "source" } else { "standby" };
+            let connection = &mut self.connections[index];
+            let (count, lag) = connection.vitals.take_shown();
+            if !connection.is_open() {
+                line += &format!(" | [{index}] {role} DOWN");
+            } else if !connection.in_sync() {
+                line += &format!(" | [{index}] {role} catching up, {} books waiting", connection.waiting());
+            } else {
+                healthy += 1;
+                messages += count;
+                let rate = count as f64 / seconds;
+                match lag {
+                    Some((mean, max)) => {
+                        lag_sum += mean;
+                        lag_max = lag_max.max(max);
+                        if detailed {
+                            line += &format!(" | [{index}] {role} {rate:.0} msg/s, lag {mean:.0} ms (max {max:.0})");
+                        }
+                    }
+                    None if detailed => line += &format!(" | [{index}] {role} {rate:.0} msg/s"),
+                    None => {}
+                }
+            }
+        }
+        if !detailed {
+            line += &format!(
+                " | {healthy} of {} connections in sync, {:.0} msg/s",
+                self.connections.len(),
+                messages as f64 / seconds
+            );
+            if lag_max > f64::MIN {
+                line += &format!(", lag {:.0} ms (max {lag_max:.0})", lag_sum / healthy.max(1) as f64);
+            }
+        }
+        eprintln!("{line}");
+    }
+
+    // ---- publishing -------------------------------------------------------
+
     /// The once-a-minute publication of every book.
     fn publish_snapshots(&mut self) {
-        self.publish_books();
-        for (index, connection) in self.connections.iter().enumerate() {
-            if !connection.is_open() {
-                eprintln!("kalshi[{index}]: not connected");
-            } else if connection.waiting() > 0 {
-                eprintln!("kalshi[{index}]: {} books are waiting for a snapshot", connection.waiting());
-            }
+        let received_at = Utc::now();
+        let mut books: Vec<(String, Event)> =
+            self.sources.iter().flat_map(|&source| self.books_of(source, received_at)).collect();
+        books.sort_by(|a, b| a.0.cmp(&b.0));
+        for (_, event) in books {
+            self.publish(event);
         }
         // Keep a steady cadence, unless we have fallen a whole interval behind.
         let now = tokio::time::Instant::now();
@@ -418,34 +703,34 @@ impl Kalshi {
         self.next_snapshot = if next > now { next } else { now + self.config.snapshot_interval };
     }
 
-    /// Publishes every one of the source's books that is in sync, in full,
-    /// in symbol order. A book still waiting for its snapshot is left out:
-    /// there is nothing trustworthy to say about it yet.
-    fn publish_books(&self) {
-        let received_at = Utc::now();
-        let mut live: Vec<(&String, &Synced<book::Book>)> = self.connections[self.source]
+    /// Every book of `connection` that is in sync, in full, by symbol. A
+    /// book still waiting for its snapshot is left out: there is nothing
+    /// trustworthy to say about it yet.
+    fn books_of(&self, connection: usize, received_at: DateTime<Utc>) -> Vec<(String, Event)> {
+        self.connections[connection]
             .books
             .iter()
             .filter(|(_, book)| book.is_live())
-            .collect();
-        live.sort_by_key(|(symbol, _)| *symbol);
-        for (symbol, book) in live {
-            let book = book.state();
-            self.publish(Event::Snapshot {
-                symbol: symbol.clone(),
-                bids: book.bids(),
-                asks: book.asks(),
-                received_at,
-                // The time of the last exchange message the book reflects.
-                exchange_timestamp: book
-                    .exchange_ms()
-                    .and_then(DateTime::from_timestamp_millis)
-                    .unwrap_or(received_at),
-            });
-        }
+            .map(|(symbol, book)| {
+                let book = book.state();
+                let event = Event::Snapshot {
+                    symbol: symbol.clone(),
+                    bids: book.bids(),
+                    asks: book.asks(),
+                    received_at,
+                    // The time of the last exchange message the book reflects.
+                    exchange_timestamp: book
+                        .exchange_ms()
+                        .and_then(DateTime::from_timestamp_millis)
+                        .unwrap_or(received_at),
+                };
+                (symbol.clone(), event)
+            })
+            .collect()
     }
 
-    fn publish(&self, event: Event) {
+    fn publish(&mut self, event: Event) {
+        self.published += 1;
         // A dropped receiver just means nobody is listening.
         let _ = self.events.send(event);
     }

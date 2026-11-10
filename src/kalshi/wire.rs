@@ -17,6 +17,9 @@ pub(super) struct Frame {
     pub(super) seq: Option<u64>,
     /// Kalshi's time for the message, Unix milliseconds.
     pub(super) timestamp_ms: Option<i64>,
+    /// When Kalshi queued the message for sending, Unix milliseconds. The
+    /// time from then until we read it is how far behind the connection is.
+    pub(super) sent_ms: Option<i64>,
     pub(super) body: Body,
 }
 
@@ -154,6 +157,7 @@ pub(super) fn parse_message(message: Message) -> anyhow::Result<Option<Frame>> {
         sid: envelope.sid,
         seq: envelope.seq,
         timestamp_ms,
+        sent_ms: envelope.sending_ts_ms,
         body,
     }))
 }

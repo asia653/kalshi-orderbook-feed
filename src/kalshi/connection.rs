@@ -47,7 +47,86 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long opening a WebSocket may take before the attempt counts as failed.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Gaps between deltas seen before the usual gap counts as known.
+const GAPS_TO_LEARN: u32 = 20;
+
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// How an open connection is doing. Its owner reads these to compare
+/// connections with each other; one connection cannot tell a quiet market
+/// from a dead subscription by itself.
+pub(super) struct Vitals {
+    /// When anything last arrived, Kalshi's 10-second pings included.
+    pub(super) last_frame_at: tokio::time::Instant,
+    /// When an orderbook message last arrived (or when the socket opened).
+    pub(super) last_book_at: tokio::time::Instant,
+    /// When a delta last arrived. Snapshots do not count: they answer our
+    /// own requests and say nothing about whether the market is moving.
+    pub(super) last_delta_at: Option<tokio::time::Instant>,
+    /// The usual time between deltas, smoothed.
+    usual_gap: Duration,
+    gaps_seen: u32,
+    /// Delay of orderbook messages since the owner last looked: the sum in
+    /// milliseconds, and how many.
+    recent_lag: (f64, u32),
+    /// The same, plus the largest and a count of all messages, since the
+    /// last status line.
+    shown_lag: (f64, u32, f64),
+    shown_messages: u64,
+}
+
+impl Vitals {
+    fn new() -> Self {
+        let now = tokio::time::Instant::now();
+        Self {
+            last_frame_at: now,
+            last_book_at: now,
+            last_delta_at: None,
+            usual_gap: Duration::ZERO,
+            gaps_seen: 0,
+            recent_lag: (0.0, 0),
+            shown_lag: (0.0, 0, f64::MIN),
+            shown_messages: 0,
+        }
+    }
+
+    /// The usual time between deltas, once enough have been seen to say.
+    pub(super) fn usual_gap(&self) -> Option<Duration> {
+        (self.gaps_seen >= GAPS_TO_LEARN).then_some(self.usual_gap)
+    }
+
+    /// Mean delay in milliseconds of the orderbook messages that arrived
+    /// since this was last called, if any did.
+    pub(super) fn take_recent_lag(&mut self) -> Option<f64> {
+        let (sum, count) = std::mem::take(&mut self.recent_lag);
+        (count > 0).then(|| sum / f64::from(count))
+    }
+
+    /// For the status line: messages, and the mean and largest delay in
+    /// milliseconds, since this was last called.
+    pub(super) fn take_shown(&mut self) -> (u64, Option<(f64, f64)>) {
+        let (sum, count, max) = std::mem::replace(&mut self.shown_lag, (0.0, 0, f64::MIN));
+        let lag = (count > 0).then(|| (sum / f64::from(count), max));
+        (std::mem::take(&mut self.shown_messages), lag)
+    }
+
+    fn on_book_message(&mut self, delta: bool, lag_ms: Option<f64>) {
+        let now = tokio::time::Instant::now();
+        self.last_book_at = now;
+        if delta {
+            if let Some(last) = self.last_delta_at {
+                let gap = now - last;
+                self.usual_gap = if self.gaps_seen == 0 { gap } else { self.usual_gap.mul_f64(0.95) + gap.mul_f64(0.05) };
+                self.gaps_seen += 1;
+            }
+            self.last_delta_at = Some(now);
+        }
+        if let Some(lag) = lag_ms {
+            self.recent_lag = (self.recent_lag.0 + lag, self.recent_lag.1 + 1);
+            self.shown_lag = (self.shown_lag.0 + lag, self.shown_lag.1 + 1, self.shown_lag.2.max(lag));
+        }
+    }
+}
 
 /// What a connection reports to its owner.
 pub(super) enum Heard {
@@ -88,6 +167,7 @@ enum Step {
     Connected(anyhow::Result<Ws>),
     Read(Option<Result<Message, tungstenite::Error>>),
     Refetch,
+    Dead,
 }
 
 pub(super) struct Connection {
@@ -95,6 +175,12 @@ pub(super) struct Connection {
     id: usize,
     /// Whether this is the source, whose book changes are reported.
     reporting: bool,
+    /// How long nothing at all may arrive before the socket counts as dead.
+    dead_after: Duration,
+    pub(super) vitals: Vitals,
+    /// Health checks in a row that found this connection quiet. Its owner
+    /// keeps count here.
+    pub(super) strikes: u32,
     ws_url: String,
     auth: Option<Arc<Auth>>,
     link: Link,
@@ -137,10 +223,13 @@ pub(super) struct Connection {
 
 impl Connection {
     /// A connection that makes its first attempt as soon as it is polled.
-    pub(super) fn new(id: usize, ws_url: String, auth: Option<Arc<Auth>>) -> Self {
+    pub(super) fn new(id: usize, ws_url: String, auth: Option<Arc<Auth>>, dead_after: Duration) -> Self {
         Self {
             id,
             reporting: false,
+            dead_after,
+            vitals: Vitals::new(),
+            strikes: 0,
             ws_url,
             auth,
             link: Link::Waiting(tokio::time::Instant::now()),
@@ -203,10 +292,16 @@ impl Connection {
                 Link::Connecting(attempt) => Step::Connected(attempt.await),
                 Link::Open(ws) => {
                     let refetch_at = self.refetch_at;
+                    let dead_at = self.vitals.last_frame_at + self.dead_after;
                     tokio::select! {
-                        read = pump(ws, &mut self.outbox, &mut self.unflushed) => Step::Read(read),
+                        // In this order: a re-fetch that is due must not wait
+                        // behind a busy socket, and a socket with something
+                        // to read is not dead, however late we are to read it.
+                        biased;
                         _ = async { tokio::time::sleep_until(refetch_at.expect("guarded")).await },
                             if refetch_at.is_some() => Step::Refetch,
+                        read = pump(ws, &mut self.outbox, &mut self.unflushed) => Step::Read(read),
+                        _ = tokio::time::sleep_until(dead_at) => Step::Dead,
                     }
                 }
                 Link::Closed => std::future::pending().await,
@@ -219,10 +314,12 @@ impl Connection {
                 }
                 Step::Connected(Ok(ws)) => {
                     self.link = Link::Open(ws);
+                    self.vitals = Vitals::new();
                     self.heard.push_back(Heard::Opened);
                 }
                 Step::Connected(Err(error)) => self.lose(error),
                 Step::Read(Some(Ok(message))) => {
+                    self.vitals.last_frame_at = tokio::time::Instant::now();
                     if let Err(error) = self.on_message(message) {
                         self.lose(error);
                     }
@@ -234,6 +331,10 @@ impl Connection {
                     self.update_books("get_snapshot", stale);
                     self.settle();
                 }
+                Step::Dead => self.lose(anyhow!(
+                    "nothing arrived, not even a ping, for {:?}",
+                    self.dead_after
+                )),
             }
         }
     }
@@ -291,6 +392,7 @@ impl Connection {
         self.books.clear();
         self.catching_up.clear();
         self.in_sync = false;
+        self.strikes = 0;
         self.subscribed.clear();
         self.book_sid = None;
         self.deferred.clear();
@@ -422,6 +524,11 @@ impl Connection {
         let Some(frame) = parse_message(message)? else {
             return Ok(());
         };
+        self.vitals.shown_messages += 1;
+        if frame.body.is_book() {
+            let lag_ms = frame.sent_ms.map(|sent| (received_at.timestamp_millis() - sent) as f64);
+            self.vitals.on_book_message(matches!(frame.body, Body::BookDelta { .. }), lag_ms);
+        }
         if let (true, Some(sid)) = (frame.body.is_book(), frame.sid) {
             self.learn_book_sid(sid);
         }
@@ -608,7 +715,7 @@ mod tests {
     use super::*;
 
     fn connection() -> Connection {
-        Connection::new(0, "ws://unused".to_owned(), None)
+        Connection::new(0, "ws://unused".to_owned(), None, Duration::from_secs(25))
     }
 
     #[test]
