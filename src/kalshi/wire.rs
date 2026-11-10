@@ -31,6 +31,9 @@ pub(super) enum Body {
     /// subscription. Its markets get lifecycle messages of their own, so
     /// this needs no action.
     EventLifecycle,
+    /// Kalshi ended a subscription. We never ask for that, so it means the
+    /// subscription is dead and nothing more will arrive on it.
+    Unsubscribed,
     /// A message type we do not act on; `raw` is its (shortened) text.
     Other { kind: String, raw: String },
 }
@@ -44,6 +47,7 @@ impl Body {
             Body::BookDelta { .. } => "orderbook_delta",
             Body::Ok => "ok",
             Body::EventLifecycle => "event_lifecycle",
+            Body::Unsubscribed => "unsubscribed",
             Body::Other { kind, .. } => kind,
         }
     }
@@ -142,6 +146,7 @@ pub(super) fn parse_message(message: Message) -> anyhow::Result<Option<Frame>> {
         }
         ("ok", _) => Body::Ok,
         ("event_lifecycle", _) => Body::EventLifecycle,
+        ("unsubscribed", _) => Body::Unsubscribed,
         ("error", msg) => bail!("kalshi websocket error: {msg:?}"),
         _ => other(&envelope.kind, text.as_str()),
     };

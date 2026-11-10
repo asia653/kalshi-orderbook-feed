@@ -44,6 +44,9 @@ fn parses_lifecycle_and_ignores_other_messages() {
     let event = parse_message(text(event)).unwrap().unwrap();
     assert!(matches!(event.body, Body::EventLifecycle));
     assert_eq!((event.sid, event.seq), (Some(1), Some(39)));
+    // As Kalshi sent it, shortly before closing the socket by itself.
+    let ended = r#"{"type":"unsubscribed","sid":2,"seq":77545,"sending_ts_ms":1794352588797}"#;
+    assert!(matches!(parse_message(text(ended)).unwrap().unwrap().body, Body::Unsubscribed));
     let error = r#"{"id":1,"type":"error","msg":{"code":8,"msg":"Unknown channel"}}"#;
     assert!(parse_message(text(error)).is_err());
 }
@@ -351,8 +354,10 @@ async fn a_lost_connection_is_reopened_and_resubscribed() {
         assert_eq!(next_command(&mut ws).await["params"]["channels"], json!(["market_lifecycle_v2"]));
         assert_eq!(next_command(&mut ws).await["params"]["market_tickers"], json!(["A", "B"]));
         send(&mut ws, snapshot(1, "A", 100, "20.00")).await;
-        // The connection dies without a word.
-        drop(ws);
+        // Kalshi ends the subscription but leaves the socket open. The
+        // service must not sit on it: it hangs up and connects again.
+        send(&mut ws, json!({"type": "unsubscribed", "sid": 2, "seq": 2})).await;
+        while let Some(Ok(_)) = ws.next().await {}
 
         // The new socket is told about every symbol at once, without
         // waiting for REST, and Kalshi starts its numbering again.

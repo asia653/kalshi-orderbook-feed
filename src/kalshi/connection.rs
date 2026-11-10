@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, anyhow};
+use anyhow::{Context, anyhow, bail};
 use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 use futures_util::{SinkExt, StreamExt};
@@ -458,6 +458,10 @@ impl Connection {
             }
             // Their sequence numbers were counted above; nothing else to do.
             Body::Ok | Body::EventLifecycle => {}
+            // Seen live: Kalshi sent this for the orderbook subscription and
+            // closed the socket a moment later. A subscription that is gone
+            // is no use, so do not wait for the close.
+            Body::Unsubscribed => bail!("Kalshi ended subscription {:?}", frame.sid),
             Body::Other { kind, raw } => self.heard.push_back(Heard::Unhandled { kind, raw }),
             Body::BookSnapshot { symbol, snapshot } => {
                 if let Some(book) = self.books.get_mut(&symbol) {
