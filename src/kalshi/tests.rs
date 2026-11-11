@@ -493,27 +493,21 @@ struct Pair {
 
 impl Pair {
     async fn start(events: Receiver<Event>, websocket: &TcpListener) -> Self {
-        let mut sockets = [accept(websocket).await, accept(websocket).await];
-        for (ws, extra) in sockets.iter_mut().zip([0, 1]) {
+        let [mut first, mut second] = [accept(websocket).await, accept(websocket).await];
+        for ws in [&mut first, &mut second] {
             assert_eq!(next_command(ws).await["params"]["channels"], json!(["market_lifecycle_v2"]));
             assert_eq!(next_command(ws).await["params"]["market_tickers"], json!(["A", "B"]));
-            send(ws, snapshot(1, "A", 100, &format!("{}.00", 20 + extra))).await;
-            send(ws, snapshot(2, "B", 100, &format!("{}.00", 30 + extra))).await;
         }
-        let mut pair = {
-            let [first, second] = sockets;
-            Pair { source: first, standby: second, standby_sent: (21, 31), events, seen: Vec::new() }
-        };
+        // Whichever connection has all of its books first is the source.
+        // Loading one socket before the other settles which that is.
+        send(&mut first, snapshot(1, "A", 100, "20.00")).await;
+        send(&mut first, snapshot(2, "B", 100, "30.00")).await;
+        let mut pair = Pair { source: first, standby: second, standby_sent: (21, 31), events, seen: Vec::new() };
         pair.wait_for(4).await;
         pair.seen[..2].sort();
-        assert_eq!(pair.seen[..2], ["+A", "+B"]);
-        if pair.seen[2] == snapshot_event("A", 21) {
-            std::mem::swap(&mut pair.source, &mut pair.standby);
-            pair.standby_sent = (20, 30);
-        }
-        let (a, b) = pair.standby_sent;
-        let source_sent = (41 - a, 61 - b);
-        assert_eq!(pair.seen[2..], [snapshot_event("A", source_sent.0), snapshot_event("B", source_sent.1)]);
+        assert_eq!(pair.seen, ["+A".to_owned(), "+B".to_owned(), snapshot_event("A", 20), snapshot_event("B", 30)]);
+        send(&mut pair.standby, snapshot(1, "A", 100, "21.00")).await;
+        send(&mut pair.standby, snapshot(2, "B", 100, "31.00")).await;
         pair
     }
 
@@ -703,6 +697,41 @@ async fn a_lagging_source_hands_over_and_reconnects() {
     // The fast connection was left alone throughout.
     let untouched = tokio::time::timeout(Duration::from_millis(200), pair.standby.next()).await;
     assert!(untouched.is_err(), "the fast connection should stay open, got {untouched:?}");
+    client.abort();
+}
+
+#[tokio::test]
+async fn connections_still_loading_their_books_are_not_judged() {
+    let (mut kalshi, _events, rest, websocket) = against_mocks_with(|config| {
+        config.connections = 2;
+        config.health.check_every = Duration::from_millis(20);
+    })
+    .await;
+    tokio::spawn(mock_rest(rest));
+    let client = tokio::spawn(async move { kalshi.run(std::future::pending()).await });
+
+    // Both sockets open before the symbol list is known, and then load A
+    // but not yet B: neither has every book, as during the burst of
+    // snapshots at startup.
+    let mut sockets = [accept(&websocket).await, accept(&websocket).await];
+    for ws in &mut sockets {
+        assert_eq!(next_command(ws).await["params"]["channels"], json!(["market_lifecycle_v2"]));
+        assert_eq!(next_command(ws).await["params"]["market_tickers"], json!(["A", "B"]));
+        send(ws, snapshot(1, "A", 100, "20.00")).await;
+    }
+    // One of them is two seconds behind the other, for many checks.
+    for seq in 2..30 {
+        for (ws, behind) in sockets.iter_mut().zip([2_000, 0]) {
+            let mut message = delta(seq, "A", 98 + seq as i64, "-0.01");
+            message["sending_ts_ms"] = json!(now_ms() - behind);
+            send(ws, message).await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for ws in &mut sockets {
+        let left_alone = tokio::time::timeout(Duration::from_millis(100), ws.next()).await;
+        assert!(left_alone.is_err(), "a connection that is still loading is not cut, got {left_alone:?}");
+    }
     client.abort();
 }
 

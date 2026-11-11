@@ -422,7 +422,10 @@ impl Connection {
     }
 
     /// Follows `symbols` on a socket that has just opened. The connection
-    /// is in sync once every one of them has loaded a snapshot.
+    /// is in sync once every one of them has loaded a snapshot, along with
+    /// any symbol added in the meantime. `symbols` is empty when the socket
+    /// opens before the symbol list is known; the connection is then not in
+    /// sync until the list has arrived and its books have loaded.
     pub(super) fn follow_all(&mut self, symbols: Vec<String>) {
         self.catching_up = symbols.iter().cloned().collect();
         let added: Vec<SymbolChange> = symbols.into_iter().map(SymbolChange::Added).collect();
@@ -443,6 +446,9 @@ impl Connection {
             match change {
                 SymbolChange::Added(symbol) => {
                     self.books.insert(symbol.clone(), Synced::new(Book::default()));
+                    if !self.in_sync {
+                        self.catching_up.insert(symbol.clone());
+                    }
                     if self.subscribed.contains(symbol) {
                         // Removed and re-added before we unsubscribed: Kalshi
                         // will not resend a snapshot unless asked.
@@ -471,9 +477,11 @@ impl Connection {
         self.settle();
     }
 
-    /// Notices the moment every book has caught up.
+    /// Notices the moment every book has caught up. A connection with no
+    /// books has nothing to offer yet, so it does not count.
     fn settle(&mut self) {
-        if self.is_open() && !self.in_sync && self.catching_up.is_empty() && self.refetch_at.is_none() {
+        let caught_up = !self.books.is_empty() && self.catching_up.is_empty() && self.refetch_at.is_none();
+        if self.is_open() && !self.in_sync && caught_up {
             self.in_sync = true;
             self.heard.push_back(Heard::InSync);
         }
