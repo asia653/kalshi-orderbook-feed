@@ -9,13 +9,14 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, ensure};
+use rust_decimal::Decimal;
 
 use super::synced::Syncable;
 use crate::Side;
 
 /// 1.0 in fixed point.
 pub(crate) const ONE: i64 = 1_000_000;
-const DECIMALS: usize = 6;
+const DECIMALS: u32 = 6;
 
 /// `(price_level, quantity)`.
 pub type Level = (i64, i64);
@@ -140,30 +141,13 @@ impl Syncable for Book {
 /// Parses one of Kalshi's decimal strings (`"0.9600"`, `"300.00"`, `"-54.00"`)
 /// into fixed point, exactly.
 pub(crate) fn parse_fp(text: &str) -> anyhow::Result<i64> {
-    let (negative, digits) = match text.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, text),
-    };
-    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
-    ensure!(
-        !(whole.is_empty() && fraction.is_empty())
-            && whole.bytes().chain(fraction.bytes()).all(|b| b.is_ascii_digit())
-            && fraction.len() <= DECIMALS,
-        "`{text}` is not a decimal with at most {DECIMALS} places"
-    );
-    let parse = |part: &str| -> anyhow::Result<i64> {
-        if part.is_empty() {
-            Ok(0)
-        } else {
-            part.parse().with_context(|| format!("`{text}` is out of range"))
-        }
-    };
-    let scale = 10_i64.pow((DECIMALS - fraction.len()) as u32);
-    let value = parse(whole)?
-        .checked_mul(ONE)
-        .and_then(|whole| whole.checked_add(parse(fraction).ok()? * scale))
-        .with_context(|| format!("`{text}` is out of range"))?;
-    Ok(if negative { -value } else { value })
+    let mut decimal = Decimal::from_str_exact(text).with_context(|| format!("`{text}` is not a decimal"))?;
+    ensure!(decimal.scale() <= DECIMALS, "`{text}` has more than {DECIMALS} decimal places");
+    // With every value at the same scale, the digits are the fixed-point
+    // number. A value too large to take the scale is left at a smaller one.
+    decimal.rescale(DECIMALS);
+    ensure!(decimal.scale() == DECIMALS, "`{text}` is out of range");
+    i64::try_from(decimal.mantissa()).with_context(|| format!("`{text}` is out of range"))
 }
 
 /// Parses a price, which must lie between 0 and 1 dollar.
@@ -205,9 +189,17 @@ mod tests {
         assert_eq!(parse_fp("1").unwrap(), ONE);
         assert_eq!(parse_fp("0.000001").unwrap(), 1);
         assert_eq!(parse_fp(".5").unwrap(), 500_000);
-        for bad in ["", "-", ".", "1.2.3", "1e3", "0.0000001", "abc", "+1", "99999999999999999999"] {
+        for bad in ["", "-", ".", "1.2.3", "1e3", "0.0000001", "abc", " 1", "0x10", "99999999999999999999"] {
             assert!(parse_fp(bad).is_err(), "{bad:?} should be rejected");
         }
+        // The largest value that fits, and the first that does not.
+        assert_eq!(parse_fp("9223372036854.775807").unwrap(), i64::MAX);
+        for bad in ["9223372036854.775808", "9999999999999999999999999999"] {
+            assert!(parse_fp(bad).is_err(), "{bad:?} should be rejected");
+        }
+        // The library is lenient about a few spellings Kalshi does not use.
+        assert_eq!(parse_fp("+1").unwrap(), ONE);
+        assert_eq!(parse_fp("1_000").unwrap(), 1_000 * ONE);
         assert!(parse_price("1.0000").is_ok());
         assert!(parse_price("1.0001").is_err());
         assert!(parse_price("-0.0100").is_err());
