@@ -60,8 +60,9 @@ const PROD_WS: &str = "wss://external-api-ws.kalshi.com/trade-api/ws/v2";
 const DEMO_REST: &str = "https://external-api.demo.kalshi.co/trade-api/v2";
 const DEMO_WS: &str = "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2";
 
-/// The longest pause between two attempts at a failing REST fetch.
-const MAX_FETCH_PAUSE: Duration = Duration::from_secs(30);
+/// The longest pause between two attempts at a failing REST fetch. Short,
+/// because at startup there are no symbols to follow until it succeeds.
+const MAX_FETCH_PAUSE: Duration = Duration::from_secs(5);
 /// The longest pause before asking again for a rate-limited REST page.
 const MAX_RATE_LIMIT_PAUSE: Duration = Duration::from_secs(5);
 

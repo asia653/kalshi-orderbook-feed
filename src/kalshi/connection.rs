@@ -40,7 +40,12 @@ use super::{Auth, Event, auth_headers};
 
 /// Symbols per subscribe / update command.
 pub(super) const COMMAND_BATCH: usize = 500;
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// The wait before the first attempt to connect again.
+const MIN_BACKOFF: Duration = Duration::from_millis(500);
+/// The longest wait before any attempt, however many have failed. Kept
+/// short on purpose: while every connection of a group is down, this wait
+/// is time without data even once Kalshi is accepting connections again.
+const MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// The shortest time between two re-fetches of every book. Several sequence
 /// gaps close together are answered with one re-fetch, not one each.
 const REFETCH_COOLDOWN: Duration = Duration::from_secs(5);
@@ -785,13 +790,17 @@ impl Connection {
     }
 }
 
-/// The pauses before successive attempts to connect: 1 s at first, doubling
-/// up to [`MAX_BACKOFF`]. Each is stretched by a random amount, up to twice
-/// as long, so that connections lost together do not all return together.
+/// The waits before successive attempts to connect. The base wait starts at
+/// [`MIN_BACKOFF`] and doubles with each failure; each wait is the base
+/// stretched by a random amount, up to twice as long, so that connections
+/// lost together do not all return together. No wait is longer than
+/// [`MAX_BACKOFF`]: 0.5 to 1 s, then 1 to 2 s, 2 to 4 s, and 2.5 to 5 s
+/// from then on.
 fn reconnect_pauses() -> ExponentialBackoff {
     ExponentialBuilder::new()
-        .with_min_delay(Duration::from_secs(1))
-        .with_max_delay(MAX_BACKOFF)
+        .with_min_delay(MIN_BACKOFF)
+        // Half, because the random stretch can double it.
+        .with_max_delay(MAX_BACKOFF / 2)
         .with_jitter()
         .without_max_times()
         .build()
