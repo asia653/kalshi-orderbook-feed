@@ -21,6 +21,7 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
+use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder};
 use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 use futures_util::{SinkExt, StreamExt};
@@ -197,8 +198,9 @@ pub(super) struct Connection {
     link: Link,
     /// When the current connection attempt started.
     started: Instant,
-    /// How long to wait before the next attempt, if this one fails.
-    backoff: Duration,
+    /// How long to wait before each next attempt, while attempts keep
+    /// failing: see [`reconnect_pauses`].
+    pauses: ExponentialBackoff,
     /// Commands not yet handed to the socket.
     outbox: VecDeque<Message>,
     /// Commands handed to the socket that it has not finished sending.
@@ -264,7 +266,7 @@ impl Connection {
             auth,
             link: Link::Waiting(tokio::time::Instant::now()),
             started: Instant::now(),
-            backoff: Duration::from_secs(1),
+            pauses: reconnect_pauses(),
             outbox: VecDeque::new(),
             unflushed: false,
             heard: VecDeque::new(),
@@ -427,15 +429,15 @@ impl Connection {
         })
     }
 
-    /// Forgets everything about the socket and schedules the next attempt:
-    /// after 1 s at first, doubling up to 30 s while attempts keep failing.
+    /// Forgets everything about the socket and schedules the next attempt,
+    /// after the next of [`reconnect_pauses`].
     fn lose(&mut self, error: anyhow::Error) {
+        // A connection that lasted a while has earned a prompt first retry.
         if self.started.elapsed() > Duration::from_secs(60) {
-            self.backoff = Duration::from_secs(1);
+            self.pauses = reconnect_pauses();
         }
-        let jitter = Duration::from_millis(rand::random::<u64>() % 1000);
-        self.link = Link::Waiting(tokio::time::Instant::now() + self.backoff + jitter);
-        self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
+        let pause = self.pauses.next().unwrap_or(MAX_BACKOFF);
+        self.link = Link::Waiting(tokio::time::Instant::now() + pause);
 
         self.outbox.clear();
         self.unflushed = false;
@@ -781,6 +783,18 @@ impl Connection {
             self.heard.push_back(Heard::Book(event));
         }
     }
+}
+
+/// The pauses before successive attempts to connect: 1 s at first, doubling
+/// up to [`MAX_BACKOFF`]. Each is stretched by a random amount, up to twice
+/// as long, so that connections lost together do not all return together.
+fn reconnect_pauses() -> ExponentialBackoff {
+    ExponentialBuilder::new()
+        .with_min_delay(Duration::from_secs(1))
+        .with_max_delay(MAX_BACKOFF)
+        .with_jitter()
+        .without_max_times()
+        .build()
 }
 
 /// Removes and returns the first `count` of `symbols`, in order.

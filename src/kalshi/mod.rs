@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use backon::{ExponentialBuilder, Retryable};
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use crossbeam::channel::{Receiver, Sender, unbounded};
@@ -872,24 +873,23 @@ struct RestMarket {
 }
 
 /// Fetches the open markets, starting over after a pause for as long as it
-/// keeps failing.
+/// keeps failing: one second at first, doubling up to [`MAX_FETCH_PAUSE`].
 async fn fetch_open_markets(
     http: reqwest::Client,
     auth: Option<Arc<Auth>>,
     url: reqwest::Url,
     series: Option<String>,
 ) -> OpenSet {
-    let mut pause = Duration::from_secs(1);
-    loop {
-        match page_open_markets(&http, &auth, &url, series.as_deref()).await {
-            Ok(open) => return open,
-            Err(error) => {
-                warn!("fetching the open markets failed: {error:#}; trying again in {pause:?}");
-                tokio::time::sleep(pause).await;
-                pause = (pause * 2).min(MAX_FETCH_PAUSE);
-            }
-        }
-    }
+    let pauses = ExponentialBuilder::new()
+        .with_min_delay(Duration::from_secs(1))
+        .with_max_delay(MAX_FETCH_PAUSE)
+        .without_max_times();
+    let fetch = || page_open_markets(&http, &auth, &url, series.as_deref());
+    let fetched = fetch
+        .retry(pauses)
+        .notify(|error, pause| warn!("fetching the open markets failed: {error:#}; trying again in {pause:?}"))
+        .await;
+    fetched.expect("there is no limit on the attempts, so it ends only by succeeding")
 }
 
 /// Pages `GET /markets?status=open`, leaving out multivariate (MVE) markets.
@@ -905,35 +905,18 @@ async fn page_open_markets(
     loop {
         // Kalshi answers 429 when requests come too fast. There is no
         // penalty: the same page is simply asked for again a little later.
-        let mut pause = Duration::from_millis(250);
-        let response = loop {
-            let mut request = http.get(url.clone()).query(&[
-                ("status", "open"),
-                ("mve_filter", "exclude"),
-                ("limit", "1000"),
-            ]);
-            if let Some(series) = series {
-                request = request.query(&[("series_ticker", series)]);
-            }
-            if !cursor.is_empty() {
-                request = request.query(&[("cursor", &cursor)]);
-            }
-            for (name, value) in auth_headers(auth, "GET", url.path())? {
-                request = request.header(name, value);
-            }
-            let response = request.send().await?;
-            if response.status() != StatusCode::TOO_MANY_REQUESTS {
-                break response;
-            }
-            warn!("REST rate limit reached; asking again in {pause:?}");
-            tokio::time::sleep(pause).await;
-            pause = (pause * 2).min(MAX_RATE_LIMIT_PAUSE);
-        };
-        let page: MarketsPage = response
-            .error_for_status()?
-            .json()
-            .await
-            .context("decoding /markets response")?;
+        // Any other failure ends the whole fetch.
+        let pauses = ExponentialBuilder::new()
+            .with_min_delay(Duration::from_millis(250))
+            .with_max_delay(MAX_RATE_LIMIT_PAUSE)
+            .without_max_times();
+        let request = || request_page(http, auth, url, series, &cursor);
+        let response = request
+            .retry(pauses)
+            .when(|error| error.is::<RateLimited>())
+            .notify(|_, pause| warn!("REST rate limit reached; asking again in {pause:?}"))
+            .await?;
+        let page: MarketsPage = response.json().await.context("decoding /markets response")?;
         for market in page.markets {
             markets.insert(market.ticker, market.close_time.map(|t| t.timestamp()));
         }
@@ -942,6 +925,45 @@ async fn page_open_markets(
             _ => return Ok(OpenSet { fetched_at, markets }),
         }
     }
+}
+
+/// Kalshi answered 429: too many requests.
+#[derive(Debug)]
+struct RateLimited;
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the REST rate limit was reached")
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
+/// Asks for the page of open markets after `cursor` (the first page when it
+/// is empty). A 429 comes back as [`RateLimited`].
+async fn request_page(
+    http: &reqwest::Client,
+    auth: &Option<Arc<Auth>>,
+    url: &reqwest::Url,
+    series: Option<&str>,
+    cursor: &str,
+) -> anyhow::Result<reqwest::Response> {
+    let mut request =
+        http.get(url.clone()).query(&[("status", "open"), ("mve_filter", "exclude"), ("limit", "1000")]);
+    if let Some(series) = series {
+        request = request.query(&[("series_ticker", series)]);
+    }
+    if !cursor.is_empty() {
+        request = request.query(&[("cursor", cursor)]);
+    }
+    for (name, value) in auth_headers(auth, "GET", url.path())? {
+        request = request.header(name, value);
+    }
+    let response = request.send().await?;
+    if response.status() == StatusCode::TOO_MANY_REQUESTS {
+        return Err(RateLimited.into());
+    }
+    Ok(response.error_for_status()?)
 }
 
 struct Auth {
