@@ -28,7 +28,7 @@ mod wire;
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use base64::Engine as _;
@@ -263,6 +263,8 @@ pub struct Kalshi {
     turn: usize,
     /// Events published since the last status line.
     published: u64,
+    /// When the last status line was printed.
+    status_at: Instant,
     /// Message types we do not handle and have already logged once.
     unhandled: HashSet<String>,
 }
@@ -352,6 +354,7 @@ impl Kalshi {
             lead: 0,
             turn: 0,
             published: 0,
+            status_at: Instant::now(),
             unhandled: HashSet::new(),
         };
         Ok((kalshi, events_rx))
@@ -385,7 +388,10 @@ impl Kalshi {
         health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let showing = self.config.status_interval.is_some();
         let mut status = tokio::time::interval(self.config.status_interval.unwrap_or(Duration::MAX));
+        // A line that is late is printed once, not once per line missed.
+        status.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         status.tick().await;
+        self.status_at = Instant::now();
         loop {
             let until_close = self.symbols.state().until_next_close(Utc::now().timestamp());
             let next_snapshot = self.next_snapshot;
@@ -671,10 +677,15 @@ impl Kalshi {
     /// One line on stderr: what is followed, what is written, and how each
     /// connection is doing.
     fn print_status(&mut self) {
-        let seconds = self.config.status_interval.map_or(1.0, |interval| interval.as_secs_f64());
+        // Rates are over the time that really passed. If that is much more
+        // than the interval, this loop was too busy to get here on time,
+        // which is worth knowing: everything else was waiting as well.
+        let interval = self.config.status_interval.map_or(1.0, |interval| interval.as_secs_f64());
+        let seconds = std::mem::replace(&mut self.status_at, Instant::now()).elapsed().as_secs_f64().max(0.001);
+        let late = seconds - interval;
         let mut line = format!(
             "kalshi: {} symbols, {:.0} events/s written",
-            self.symbols.state().symbols().len(),
+            self.symbols.state().len(),
             std::mem::take(&mut self.published) as f64 / seconds,
         );
         let detailed = self.connections.len() <= 4;
@@ -715,6 +726,9 @@ impl Kalshi {
                 line += &format!(", lag {:.0} ms (max {lag_max:.0})", lag_sum / healthy.max(1) as f64);
             }
         }
+        if late > 1.0 {
+            line += &format!(" | this line is {late:.1} s late: the service is not keeping up");
+        }
         eprintln!("{line}");
     }
 
@@ -722,12 +736,20 @@ impl Kalshi {
 
     /// The once-a-minute publication of every book.
     fn publish_snapshots(&mut self) {
+        let started = Instant::now();
         let received_at = Utc::now();
         let mut books: Vec<(String, Event)> =
             self.sources.iter().flat_map(|&source| self.books_of(source, received_at)).collect();
         books.sort_by(|a, b| a.0.cmp(&b.0));
+        let count = books.len();
         for (_, event) in books {
             self.publish(event);
+        }
+        // Nothing is read from the sockets while this runs, so say so when
+        // it takes long enough to matter.
+        let took = started.elapsed();
+        if took > Duration::from_millis(250) {
+            eprintln!("kalshi: the snapshot of {count} books held everything else up for {took:.0?}");
         }
         // Keep a steady cadence, unless we have fallen a whole interval behind.
         let now = tokio::time::Instant::now();

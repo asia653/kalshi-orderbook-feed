@@ -3,7 +3,7 @@
 //! Its snapshot is the open set from REST and its deltas are
 //! `market_lifecycle_v2` events. Nothing here does any I/O.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -45,6 +45,12 @@ pub(crate) struct SymbolList {
     /// Only follow markets in this series. `None` follows everything.
     series: Option<String>,
     markets: HashMap<String, Market>,
+    /// Every known close time with its market, soonest first. Kept beside
+    /// `markets` so the next close is found without looking at every market:
+    /// that question is asked once per message received.
+    closes: BTreeSet<(i64, String)>,
+    /// How many markets are active.
+    active: usize,
 }
 
 impl SymbolList {
@@ -52,6 +58,8 @@ impl SymbolList {
         Self {
             series,
             markets: HashMap::new(),
+            closes: BTreeSet::new(),
+            active: 0,
         }
     }
 
@@ -67,25 +75,37 @@ impl SymbolList {
         symbols
     }
 
+    /// How many symbols there are.
+    pub(crate) fn len(&self) -> usize {
+        self.active
+    }
+
     /// Removes every market whose close time has passed. Kalshi sends no
     /// "closed" event, so this is how a symbol stops trading on time.
     pub(crate) fn expire(&mut self, now: i64, changes: &mut Vec<SymbolChange>) {
-        let closed: Vec<String> = self
-            .markets
-            .iter()
-            .filter(|(_, market)| market.close_ts.is_some_and(|close| close <= now))
-            .map(|(ticker, _)| ticker.clone())
-            .collect();
-        for ticker in closed {
+        while self.closes.first().is_some_and(|(close, _)| *close <= now) {
+            let (_, ticker) = self.closes.pop_first().expect("checked not empty");
             self.remove(&ticker, changes);
         }
     }
 
     pub(crate) fn until_next_close(&self, now: i64) -> Duration {
-        let next = self.markets.values().filter_map(|m| m.close_ts).min();
-        match next {
-            Some(close) => Duration::from_secs(close.saturating_sub(now).max(0) as u64),
+        match self.closes.first() {
+            Some((close, _)) => Duration::from_secs(close.saturating_sub(now).max(0) as u64),
             None => Duration::from_secs(24 * 60 * 60),
+        }
+    }
+
+    /// Records `ticker`'s close time, if the market is known.
+    fn set_close(&mut self, ticker: &str, close_ts: Option<i64>) {
+        let Some(market) = self.markets.get_mut(ticker) else {
+            return;
+        };
+        if let Some(old) = std::mem::replace(&mut market.close_ts, close_ts) {
+            self.closes.remove(&(old, ticker.to_owned()));
+        }
+        if let Some(new) = close_ts {
+            self.closes.insert((new, ticker.to_owned()));
         }
     }
 
@@ -106,26 +126,30 @@ impl SymbolList {
         close_ts: Option<i64>,
         changes: &mut Vec<SymbolChange>,
     ) {
-        let market = self.markets.entry(ticker.clone()).or_insert(Market {
-            active: false,
-            close_ts,
-        });
+        self.markets.entry(ticker.clone()).or_insert(Market { active: false, close_ts: None });
         if close_ts.is_some() {
-            market.close_ts = close_ts;
+            self.set_close(&ticker, close_ts);
         }
+        let market = self.markets.get_mut(&ticker).expect("just inserted");
         if market.active != active {
             market.active = active;
-            changes.push(if active {
-                SymbolChange::Added(ticker)
+            if active {
+                self.active += 1;
+                changes.push(SymbolChange::Added(ticker));
             } else {
-                SymbolChange::Removed(ticker)
-            });
+                self.active -= 1;
+                changes.push(SymbolChange::Removed(ticker));
+            }
         }
     }
 
     fn remove(&mut self, ticker: &str, changes: &mut Vec<SymbolChange>) {
         if let Some(market) = self.markets.remove(ticker) {
+            if let Some(close) = market.close_ts {
+                self.closes.remove(&(close, ticker.to_owned()));
+            }
             if market.active {
+                self.active -= 1;
                 changes.push(SymbolChange::Removed(ticker.to_owned()));
             }
         }
@@ -169,10 +193,10 @@ impl Syncable for SymbolList {
         let ticker = event.market_ticker;
         match event.event_type.as_str() {
             "created" => {
-                self.markets.entry(ticker).or_insert(Market {
-                    active: false,
-                    close_ts: event.close_ts,
-                });
+                if !self.markets.contains_key(&ticker) {
+                    self.markets.insert(ticker.clone(), Market { active: false, close_ts: None });
+                    self.set_close(&ticker, event.close_ts);
+                }
             }
             "activated" => self.set_active(ticker, true, event.close_ts, changes),
             // Sent for both pause and unpause; `is_deactivated` says which.
@@ -180,11 +204,7 @@ impl Syncable for SymbolList {
                 let paused = event.is_deactivated.unwrap_or(true);
                 self.set_active(ticker, !paused, event.close_ts, changes);
             }
-            "close_date_updated" => {
-                if let Some(market) = self.markets.get_mut(&ticker) {
-                    market.close_ts = event.close_ts;
-                }
-            }
+            "close_date_updated" => self.set_close(&ticker, event.close_ts),
             "determined" | "settled" => self.remove(&ticker, changes),
             _ => {}
         }
@@ -201,7 +221,7 @@ impl Syncable for SymbolList {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeSet, HashSet};
 
     use super::super::synced::Synced;
     use super::*;
@@ -336,6 +356,54 @@ mod tests {
         assert_eq!(expired, HashSet::from([removed("B")]));
         assert_eq!(list.symbols(), ["A", "C"]);
         assert_eq!(list.until_next_close(400), Duration::ZERO);
+    }
+
+    /// The close-time index and the count are kept beside the markets, so
+    /// they must agree with them after every kind of change.
+    #[test]
+    fn the_close_index_and_the_count_follow_every_change() {
+        fn check(list: &SymbolList) {
+            let closes: BTreeSet<(i64, String)> = list
+                .markets
+                .iter()
+                .filter_map(|(ticker, market)| Some((market.close_ts?, ticker.clone())))
+                .collect();
+            assert_eq!(list.closes, closes);
+            assert_eq!(list.len(), list.symbols().len());
+        }
+        let mut list = SymbolList::new(None);
+        let with_close = |ticker: &str, kind: &str, close: Option<i64>| {
+            let mut event = event(ticker, kind);
+            event.close_ts = close;
+            event
+        };
+        let set = OpenSet {
+            fetched_at: 0,
+            markets: HashMap::from([("A".to_owned(), Some(100)), ("B".to_owned(), Some(200)), ("C".to_owned(), None)]),
+        };
+        list.load(set, &mut Vec::new());
+        check(&list);
+        let steps = [
+            with_close("D", "created", Some(150)),
+            with_close("D", "activated", Some(160)),
+            with_close("A", "close_date_updated", Some(300)),
+            with_close("B", "close_date_updated", None),
+            with_close("C", "close_date_updated", Some(50)),
+            with_close("D", "deactivated", None),
+            with_close("A", "settled", None),
+            with_close("E", "activated", None),
+        ];
+        for step in steps {
+            list.apply(step, &mut Vec::new()).unwrap();
+            check(&list);
+        }
+        assert_eq!(list.until_next_close(0), Duration::from_secs(50));
+        list.expire(155, &mut Vec::new());
+        check(&list);
+        assert_eq!(list.symbols(), ["B", "E"], "C closed at 50; D is paused, and closes at 160");
+        let reload = OpenSet { fetched_at: 156, markets: HashMap::from([("B".to_owned(), Some(400))]) };
+        list.load(reload, &mut Vec::new());
+        check(&list);
     }
 
     #[test]

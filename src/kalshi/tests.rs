@@ -900,6 +900,76 @@ fn the_status_line_can_be_printed_before_anything_is_connected() {
 }
 
 /// Live check against the demo environment; needs network, no API key.
+/// How long it takes to load every book at the scale of all of Kalshi's
+/// markets, against a mock that answers as fast as it is asked. A measure,
+/// not a pass or fail on a clock: it only requires that the load finishes.
+///
+/// Run with `cargo test --release at_full_scale -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore]
+async fn at_full_scale_every_book_loads() {
+    const MARKETS: usize = 230_000;
+    let (mut kalshi, events, rest, websocket) = against_mocks_with(|config| {
+        config.connections = 2;
+        config.snapshot_interval = Duration::from_secs(30);
+        // This mock sends no pings.
+        config.health.dead_after = Duration::from_secs(3600);
+    })
+    .await;
+    // Close times like the real ones: all different, none soon.
+    let tickers: Vec<String> = (0..MARKETS).map(|n| format!("KXSCALE-26NOV{:05}-T{n:06}", n / 20)).collect();
+    tokio::spawn(serve_markets(rest, tickers));
+    let client = tokio::spawn(async move { kalshi.run(std::future::pending()).await });
+    for _ in 0..2 {
+        let mut ws = accept(&websocket).await;
+        tokio::spawn(async move {
+            let mut seq = 0u64;
+            while let Some(Ok(message)) = ws.next().await {
+                let Message::Text(text) = message else { continue };
+                let command: Value = serde_json::from_str(text.as_str()).unwrap();
+                let Some(batch) = command["params"]["market_tickers"].as_array() else { continue };
+                for ticker in batch {
+                    seq += 1;
+                    let snapshot = snapshot(seq, ticker.as_str().unwrap(), 100, "20.00");
+                    if ws.feed(Message::Text(snapshot.to_string().into())).await.is_err() {
+                        return;
+                    }
+                }
+                if ws.flush().await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+    let started = Instant::now();
+    let mut snapshots = 0usize;
+    let mut last_report = Instant::now();
+    // The source publishes each book once as it loads; a handover at the
+    // end publishes them all again. Either way every book has been seen.
+    while snapshots < MARKETS {
+        snapshots += events.try_iter().filter(|event| matches!(event, Event::Snapshot { .. })).count();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if last_report.elapsed() > Duration::from_secs(5) {
+            last_report = Instant::now();
+            eprintln!("{snapshots} snapshots published after {:.0?}", started.elapsed());
+        }
+        assert!(started.elapsed() < Duration::from_secs(600), "only {snapshots} books after ten minutes");
+    }
+    eprintln!("{MARKETS} books loaded on two connections in {:.1?}", started.elapsed());
+
+    // Then one full round of snapshots, as every minute in real use. How
+    // long it holds the loop up is logged by the service itself.
+    let _ = events.try_iter().count();
+    let mut round = 0usize;
+    while round < MARKETS {
+        round += events.try_iter().filter(|event| matches!(event, Event::Snapshot { .. })).count();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(started.elapsed() < Duration::from_secs(600), "no full round of snapshots");
+    }
+    eprintln!("a round of {round} snapshots was published");
+    client.abort();
+}
+
 /// Run with `cargo test live -- --ignored --nocapture`.
 #[tokio::test]
 #[ignore]
