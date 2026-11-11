@@ -171,8 +171,8 @@ enum Step {
 }
 
 pub(super) struct Connection {
-    /// Its position among the owner's connections; used in log lines.
-    id: usize,
+    /// What it is called in log lines.
+    name: String,
     /// Whether this is the source, whose book changes are reported.
     reporting: bool,
     /// How long nothing at all may arrive before the socket counts as dead.
@@ -226,9 +226,9 @@ pub(super) struct Connection {
 
 impl Connection {
     /// A connection that makes its first attempt as soon as it is polled.
-    pub(super) fn new(id: usize, ws_url: String, auth: Option<Arc<Auth>>, dead_after: Duration) -> Self {
+    pub(super) fn new(name: String, ws_url: String, auth: Option<Arc<Auth>>, dead_after: Duration) -> Self {
         Self {
-            id,
+            name,
             reporting: false,
             dead_after,
             vitals: Vitals::new(),
@@ -253,6 +253,11 @@ impl Connection {
             last_refetch: None,
             next_command_id: 0,
         }
+    }
+
+    /// What this connection is called in the log.
+    pub(super) fn name(&self) -> &str {
+        &self.name
     }
 
     pub(super) fn is_open(&self) -> bool {
@@ -361,7 +366,7 @@ impl Connection {
             }
         };
         if tokio::time::timeout(CLOSE_TIMEOUT, handshake).await.is_err() {
-            eprintln!("kalshi[{}]: no close acknowledgement; dropping the connection", self.id);
+            eprintln!("kalshi[{}]: no close acknowledgement; dropping the connection", self.name);
         }
     }
 
@@ -552,7 +557,7 @@ impl Connection {
             if let (true, Some(last)) = (self.is_gap(sid, seq), last) {
                 eprintln!(
                     "kalshi[{}]: sequence gap on subscription {sid}: expected {}, got {seq} ({})",
-                    self.id,
+                    self.name,
                     last + 1,
                     frame.body.kind(),
                 );
@@ -571,7 +576,7 @@ impl Connection {
         match frame.body {
             Body::Lifecycle(event) => self.heard.push_back(Heard::Lifecycle(event)),
             Body::Subscribed { channel, sid } => {
-                eprintln!("kalshi[{}]: subscribed to {channel} as subscription {sid}", self.id);
+                eprintln!("kalshi[{}]: subscribed to {channel} as subscription {sid}", self.name);
                 if channel == BOOK_CHANNEL {
                     self.learn_book_sid(sid);
                 }
@@ -599,7 +604,7 @@ impl Connection {
                     let applied = book.on_delta(delta, &mut changes);
                     self.report(&symbol, changes, received_at, exchange_timestamp);
                     if let Err(error) = applied {
-                        eprintln!("kalshi[{}]: {symbol}: {error:#}; requesting a snapshot", self.id);
+                        eprintln!("kalshi[{}]: {symbol}: {error:#}; requesting a snapshot", self.name);
                         self.update_books("get_snapshot", vec![symbol]);
                     }
                 }
@@ -646,7 +651,7 @@ impl Connection {
             .map(|(symbol, _)| symbol.clone())
             .collect();
         stale.sort();
-        eprintln!("kalshi[{}]: re-fetching {} books after a sequence gap", self.id, stale.len());
+        eprintln!("kalshi[{}]: re-fetching {} books after a sequence gap", self.name, stale.len());
         stale
     }
 
@@ -728,7 +733,7 @@ mod tests {
     use super::*;
 
     fn connection() -> Connection {
-        Connection::new(0, "ws://unused".to_owned(), None, Duration::from_secs(25))
+        Connection::new("A".to_owned(), "ws://unused".to_owned(), None, Duration::from_secs(25))
     }
 
     #[test]

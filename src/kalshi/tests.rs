@@ -818,6 +818,20 @@ async fn symbols_are_divided_between_groups_by_event() {
 }
 
 #[test]
+fn connections_are_named_by_letter_and_group() {
+    let mut config = KalshiConfig::demo();
+    (config.connections, config.groups) = (2, 1);
+    let names = |config: &KalshiConfig| -> Vec<String> {
+        (0..config.connections * config.groups).map(|index| connection_name(index, config)).collect()
+    };
+    assert_eq!(names(&config), ["A", "B"]);
+    config.groups = 2;
+    assert_eq!(names(&config), ["A1", "B1", "A2", "B2"]);
+    (config.connections, config.groups) = (28, 1);
+    assert_eq!(names(&config)[25..], ["Z", "AA", "AB"]);
+}
+
+#[test]
 fn groups_are_stable_and_roughly_even() {
     assert_eq!(group_for("KXBTCD-26NOV1017-T1", 8), group_for("KXBTCD-26NOV1017-T99999.99", 8));
     assert_eq!(group_for("ANYTHING", 1), 0);

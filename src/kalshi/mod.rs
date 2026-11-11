@@ -277,6 +277,26 @@ fn group_for(symbol: &str, groups: usize) -> usize {
     (hash % groups as u64) as usize
 }
 
+/// What connection `index` is called in the log: a letter for its place in
+/// its group, then the group's number when there is more than one group.
+/// One group of two is A and B; two groups are A1, B1, A2 and B2.
+fn connection_name(index: usize, config: &KalshiConfig) -> String {
+    let (group, mut place) = (index / config.connections, index % config.connections);
+    // Past Z the letters carry on as a spreadsheet's columns do: AA, AB, ...
+    let mut name = String::new();
+    loop {
+        name.insert(0, char::from(b'A' + (place % 26) as u8));
+        if place < 26 {
+            break;
+        }
+        place = place / 26 - 1;
+    }
+    if config.groups > 1 {
+        name += &(group + 1).to_string();
+    }
+    name
+}
+
 impl Kalshi {
     /// Returns the object and the receiving end of its event channel.
     pub fn new(config: KalshiConfig) -> anyhow::Result<(Self, Receiver<Event>)> {
@@ -304,7 +324,7 @@ impl Kalshi {
         anyhow::ensure!(config.connections >= 1, "at least one connection is needed");
         anyhow::ensure!(config.groups >= 1, "at least one group is needed");
         let mut connections: Vec<Connection> = (0..config.groups * config.connections)
-            .map(|id| Connection::new(id, config.ws_url.clone(), auth.clone(), config.health.dead_after))
+            .map(|index| Connection::new(connection_name(index, &config), config.ws_url.clone(), auth.clone(), config.health.dead_after))
             .collect();
         // Each group starts with its first connection as the source.
         let sources: Vec<usize> = (0..config.groups).map(|group| group * config.connections).collect();
@@ -374,7 +394,7 @@ impl Kalshi {
                 Some(()) = drop_source.next() => {
                     // The first group's source: one cut is enough to watch.
                     let source = self.sources[0];
-                    eprintln!("kalshi: dropping connection {source} on request");
+                    eprintln!("kalshi: dropping connection {} on request", self.connections[source].name());
                     self.connections[source].drop_socket("dropped on request");
                 }
                 open = async { fetch.as_mut().expect("guarded").await }, if fetching => {
@@ -438,7 +458,7 @@ impl Kalshi {
                 }
             }
             Heard::Lost(error) => {
-                eprintln!("kalshi[{index}]: connection lost: {error:#}");
+                eprintln!("kalshi[{}]: connection lost: {error:#}", self.connections[index].name());
                 if index == self.lead {
                     let open = (0..self.connections.len()).find(|&i| self.connections[i].is_open());
                     self.follow_lead(open.unwrap_or(index));
@@ -497,7 +517,11 @@ impl Kalshi {
     /// snapshot of each book replaces whatever the old source said.
     fn switch_source(&mut self, group: usize, next: usize) {
         let old = std::mem::replace(&mut self.sources[group], next);
-        eprintln!("kalshi: the source is now connection {next} (was {old})");
+        eprintln!(
+            "kalshi: the source is now connection {} (was {})",
+            self.connections[next].name(),
+            self.connections[old].name()
+        );
         self.connections[old].set_reporting(false);
         self.connections[next].set_reporting(true);
         let mut books = self.books_of(next, Utc::now());
@@ -632,8 +656,9 @@ impl Kalshi {
                 if self.sources[group] == slow {
                     self.switch_source(group, fastest);
                 }
+                let faster = self.connections[fastest].name().to_owned();
                 self.connections[slow].drop_socket(&format!(
-                    "lagging: {lag:.0} ms behind Kalshi against {fastest_lag:.0} ms on connection {fastest}"
+                    "lagging: {lag:.0} ms behind Kalshi against {fastest_lag:.0} ms on connection {faster}"
                 ));
             }
         }
@@ -653,11 +678,12 @@ impl Kalshi {
         for index in 0..self.connections.len() {
             let role = if self.sources[self.group_of(index)] == index { "source" } else { "standby" };
             let connection = &mut self.connections[index];
+            let name = connection.name().to_owned();
             let (count, lag) = connection.vitals.take_shown();
             if !connection.is_open() {
-                line += &format!(" | [{index}] {role} DOWN");
+                line += &format!(" | [{name}] {role} DOWN");
             } else if !connection.in_sync() {
-                line += &format!(" | [{index}] {role} catching up, {} books waiting", connection.waiting());
+                line += &format!(" | [{name}] {role} catching up, {} books waiting", connection.waiting());
             } else {
                 healthy += 1;
                 messages += count;
@@ -667,10 +693,10 @@ impl Kalshi {
                         lag_sum += mean;
                         lag_max = lag_max.max(max);
                         if detailed {
-                            line += &format!(" | [{index}] {role} {rate:.0} msg/s, lag {mean:.0} ms (max {max:.0})");
+                            line += &format!(" | [{name}] {role} {rate:.0} msg/s, lag {mean:.0} ms (max {max:.0})");
                         }
                     }
-                    None if detailed => line += &format!(" | [{index}] {role} {rate:.0} msg/s"),
+                    None if detailed => line += &format!(" | [{name}] {role} {rate:.0} msg/s"),
                     None => {}
                 }
             }
