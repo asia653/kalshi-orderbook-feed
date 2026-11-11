@@ -305,6 +305,8 @@ pub struct Kalshi {
     published: u64,
     /// When the last status line was printed.
     status_at: Instant,
+    /// The measured delay that stands for "no delay": see [`lag_floor`].
+    lag_floor: f64,
     /// Message types we do not handle and have already logged once.
     unhandled: HashSet<String>,
 }
@@ -321,6 +323,25 @@ fn group_for(symbol: &str, groups: usize) -> usize {
         (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
     });
     (hash % groups as u64) as usize
+}
+
+/// How far the floor under the delays may rise, in milliseconds per second.
+const LAG_FLOOR_RISE: f64 = 0.5;
+
+/// The measured delay that stands for "no delay", given the one in use
+/// until now and the least delay measured in the last `seconds`.
+///
+/// A delay is measured as our clock's time of arrival minus Kalshi's clock's
+/// time of sending. The two clocks differ, so every measurement is off by
+/// the same unknown amount, and comes out negative when ours is behind. The
+/// least delay seen is the nearest thing to a message that was not delayed
+/// at all, so delays are shown as what they are above it.
+///
+/// The floor drops at once to anything lower. It also creeps upward, so
+/// that a clock that drifts or is corrected does not leave it too low for
+/// ever.
+fn lag_floor(floor: f64, least: f64, seconds: f64) -> f64 {
+    least.min(floor + LAG_FLOOR_RISE * seconds)
 }
 
 /// What connection `index` is called in the log: a letter for its place in
@@ -409,6 +430,7 @@ impl Kalshi {
             turn: 0,
             published: 0,
             status_at: Instant::now(),
+            lag_floor: f64::INFINITY,
             unhandled: HashSet::new(),
         };
         Ok((kalshi, events_rx))
@@ -728,27 +750,40 @@ impl Kalshi {
         }
     }
 
-    /// One line on stderr: what is followed, what is written, and how each
+    /// One log line: what is followed, what is written, and how each
     /// connection is doing.
     fn print_status(&mut self) {
+        let (line, late) = self.status_line();
+        if late > 1.0 {
+            warn!("{line} | this line is {late:.1} s late: the service is not keeping up");
+        } else {
+            info!("{line}");
+        }
+    }
+
+    /// The status line, and how many seconds late it is.
+    fn status_line(&mut self) -> (String, f64) {
         // Rates are over the time that really passed. If that is much more
         // than the interval, this loop was too busy to get here on time,
         // which is worth knowing: everything else was waiting as well.
         let interval = self.config.status_interval.map_or(1.0, |interval| interval.as_secs_f64());
         let seconds = std::mem::replace(&mut self.status_at, Instant::now()).elapsed().as_secs_f64().max(0.001);
-        let late = seconds - interval;
         let mut line = format!(
             "{} symbols, {:.0} events/s written",
             self.symbols.state().len(),
             std::mem::take(&mut self.published) as f64 / seconds,
         );
+        let shown: Vec<_> = self.connections.iter_mut().map(|connection| connection.vitals.take_shown()).collect();
+        let least = shown.iter().filter_map(|(_, lag)| Some(lag.as_ref()?.1)).fold(f64::INFINITY, f64::min);
+        self.lag_floor = lag_floor(self.lag_floor, least, seconds);
+        let floor = self.lag_floor;
+
         let detailed = self.connections.len() <= 4;
         let (mut healthy, mut messages, mut lag_sum, mut lag_max) = (0usize, 0u64, 0.0f64, f64::MIN);
-        for index in 0..self.connections.len() {
+        for (index, (count, lag)) in shown.into_iter().enumerate() {
             let role = if self.sources[self.group_of(index)] == index { "source" } else { "standby" };
-            let connection = &mut self.connections[index];
-            let name = connection.name().to_owned();
-            let (count, lag) = connection.vitals.take_shown();
+            let connection = &self.connections[index];
+            let name = connection.name();
             if !connection.is_open() {
                 line += &format!(" | [{name}] {role} DOWN");
             } else if !connection.in_sync() {
@@ -758,11 +793,12 @@ impl Kalshi {
                 messages += count;
                 let rate = count as f64 / seconds;
                 match lag {
-                    Some((mean, max)) => {
+                    Some((mean, _, greatest)) => {
+                        let (mean, greatest) = (mean - floor, greatest - floor);
                         lag_sum += mean;
-                        lag_max = lag_max.max(max);
+                        lag_max = lag_max.max(greatest);
                         if detailed {
-                            line += &format!(" | [{name}] {role} {rate:.0} msg/s, lag {mean:.0} ms (max {max:.0})");
+                            line += &format!(" | [{name}] {role} {rate:.0} msg/s, lag {mean:.0} ms (max {greatest:.0})");
                         }
                     }
                     None if detailed => line += &format!(" | [{name}] {role} {rate:.0} msg/s"),
@@ -780,11 +816,7 @@ impl Kalshi {
                 line += &format!(", lag {:.0} ms (max {lag_max:.0})", lag_sum / healthy.max(1) as f64);
             }
         }
-        if late > 1.0 {
-            warn!("{line} | this line is {late:.1} s late: the service is not keeping up");
-        } else {
-            info!("{line}");
-        }
+        (line, seconds - interval)
     }
 
     // ---- publishing -------------------------------------------------------

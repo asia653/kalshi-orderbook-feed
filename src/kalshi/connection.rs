@@ -78,9 +78,12 @@ pub(super) struct Vitals {
     recent_lag: (f64, u32),
     /// The same, plus the largest and a count of all messages, since the
     /// last status line.
-    shown_lag: (f64, u32, f64),
+    shown_lag: (f64, u32, f64, f64),
     shown_messages: u64,
 }
+
+/// No delays seen yet: a sum, a count, the least and the greatest.
+const NO_LAGS: (f64, u32, f64, f64) = (0.0, 0, f64::INFINITY, f64::NEG_INFINITY);
 
 impl Vitals {
     fn new() -> Self {
@@ -92,7 +95,7 @@ impl Vitals {
             usual_gap: Duration::ZERO,
             gaps_seen: 0,
             recent_lag: (0.0, 0),
-            shown_lag: (0.0, 0, f64::MIN),
+            shown_lag: NO_LAGS,
             shown_messages: 0,
         }
     }
@@ -109,11 +112,11 @@ impl Vitals {
         (count > 0).then(|| sum / f64::from(count))
     }
 
-    /// For the status line: messages, and the mean and largest delay in
-    /// milliseconds, since this was last called.
-    pub(super) fn take_shown(&mut self) -> (u64, Option<(f64, f64)>) {
-        let (sum, count, max) = std::mem::replace(&mut self.shown_lag, (0.0, 0, f64::MIN));
-        let lag = (count > 0).then(|| (sum / f64::from(count), max));
+    /// For the status line: messages since this was last called, and the
+    /// mean, least and greatest delay among them in milliseconds.
+    pub(super) fn take_shown(&mut self) -> (u64, Option<(f64, f64, f64)>) {
+        let (sum, count, least, greatest) = std::mem::replace(&mut self.shown_lag, NO_LAGS);
+        let lag = (count > 0).then(|| (sum / f64::from(count), least, greatest));
         (std::mem::take(&mut self.shown_messages), lag)
     }
 
@@ -130,7 +133,8 @@ impl Vitals {
         }
         if let Some(lag) = lag_ms {
             self.recent_lag = (self.recent_lag.0 + lag, self.recent_lag.1 + 1);
-            self.shown_lag = (self.shown_lag.0 + lag, self.shown_lag.1 + 1, self.shown_lag.2.max(lag));
+            let (sum, count, least, greatest) = self.shown_lag;
+            self.shown_lag = (sum + lag, count + 1, least.min(lag), greatest.max(lag));
         }
     }
 }

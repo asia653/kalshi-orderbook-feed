@@ -877,6 +877,53 @@ fn groups_are_stable_and_roughly_even() {
 }
 
 #[test]
+fn the_lag_floor_drops_at_once_and_rises_slowly() {
+    assert_eq!(lag_floor(f64::INFINITY, -95.0, 5.0), -95.0, "the first delays seen set it");
+    assert_eq!(lag_floor(-95.0, -120.0, 5.0), -120.0);
+    assert_eq!(lag_floor(-95.0, 40.0, 5.0), -92.5, "half a millisecond a second");
+    assert_eq!(lag_floor(-95.0, f64::INFINITY, 5.0), -92.5, "also when nothing was measured");
+}
+
+/// With our clock behind Kalshi's, every delay measures as negative. The
+/// status line shows each as what it is above the least one seen.
+#[tokio::test]
+async fn lag_is_shown_above_the_least_delay_seen() {
+    let (mut kalshi, _events, rest, websocket) = against_mocks(1).await;
+    mock_rest(&rest).await;
+    let script = async {
+        let mut ws = accept(&websocket).await;
+        assert_eq!(next_command(&mut ws).await["params"]["channels"], json!(["market_lifecycle_v2"]));
+        assert_eq!(next_command(&mut ws).await["params"]["market_tickers"], json!(["A", "B"]));
+        // Stamped as sent 95 ms and 15 ms from now, as a clock ahead of
+        // ours would stamp them.
+        let stamped = |mut message: Value, ahead: i64| {
+            message["sending_ts_ms"] = json!(now_ms() + ahead);
+            message
+        };
+        // Written together, so that they also arrive together.
+        let first = stamped(snapshot(1, "A", 100, "20.00"), 95);
+        ws.feed(Message::Text(first.to_string().into())).await.unwrap();
+        send(&mut ws, stamped(snapshot(2, "B", 100, "30.00"), 15)).await;
+        // The unsubscribe that answers this proves both were handled.
+        send(&mut ws, lifecycle(1, "B", "settled")).await;
+        assert_eq!(next_command(&mut ws).await["params"]["action"], "delete_markets");
+    };
+    tokio::select! {
+        _ = kalshi.run(std::future::pending()) => unreachable!("run only returns on shutdown"),
+        _ = script => {}
+    }
+
+    let (line, _) = kalshi.status_line();
+    let number = |after: &str| -> f64 {
+        let rest = line.split(after).nth(1).unwrap_or_else(|| panic!("no `{after}` in: {line}"));
+        rest.split([' ', ')']).next().unwrap().parse().unwrap()
+    };
+    // Measured as about -95 and -15: 0 and 80 above the least, 40 on average.
+    let (mean, max) = (number("lag "), number("max "));
+    assert!((30.0..=50.0).contains(&mean) && (70.0..=90.0).contains(&max), "{line}");
+}
+
+#[test]
 fn the_status_line_can_be_printed_before_anything_is_connected() {
     let mut config = KalshiConfig::demo();
     config.groups = 3;
@@ -885,7 +932,6 @@ fn the_status_line_can_be_printed_before_anything_is_connected() {
     kalshi.check_health();
 }
 
-/// Live check against the demo environment; needs network, no API key.
 /// How long it takes to load every book at the scale of all of Kalshi's
 /// markets, against a mock that answers as fast as it is asked. A measure,
 /// not a pass or fail on a clock: it only requires that the load finishes.
@@ -956,6 +1002,7 @@ async fn at_full_scale_every_book_loads() {
     client.abort();
 }
 
+/// Live check against the demo environment; needs network, no API key.
 /// Run with `cargo test live -- --ignored --nocapture`.
 #[tokio::test]
 #[ignore]
