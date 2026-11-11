@@ -2,24 +2,27 @@
 //! as SBE messages: a `PriceLevelUpdate` for every change, and a `Snapshot`
 //! of every book once a minute. Logs go to stderr.
 //!
-//! Configuration comes from the environment; see [`KalshiConfig::from_env`].
+//! Settings come from flags or the environment; run with `--help`, or see
+//! [`Options`].
 //! SIGINT (Ctrl-C) closes the WebSockets, then the output, and exits.
 //! SIGUSR1 cuts the source connection, to watch the standby take over.
 
 use anyhow::bail;
-use engineering_challenge::kalshi::{Kalshi, KalshiConfig};
+use clap::Parser;
+use engineering_challenge::kalshi::{Kalshi, KalshiConfig, Options};
 use engineering_challenge::output::{Output, STDOUT};
 use tokio::signal::unix::{SignalKind, signal};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
+    let options = Options::parse();
     engineering_challenge::logging::init();
     let mut sigint = signal(SignalKind::interrupt())?;
     let sigusr1 = signal(SignalKind::user_defined1())?;
     let drop_source = Box::pin(futures_util::stream::unfold(sigusr1, |mut signal| async move {
         signal.recv().await.map(|()| ((), signal))
     }));
-    let (mut kalshi, events) = Kalshi::new(KalshiConfig::from_env()?)?;
+    let (mut kalshi, events) = Kalshi::new(KalshiConfig::from_options(options)?)?;
 
     // File writes block, so they get their own thread. It ends when the
     // event channel closes, or early if a write fails.

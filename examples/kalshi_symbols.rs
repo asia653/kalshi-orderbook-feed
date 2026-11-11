@@ -1,15 +1,16 @@
 //! Prints every event (symbol changes, snapshots, level updates) as text,
 //! for watching what the service sees. Runs until killed.
 //!
-//! Needs `KALSHI_API_KEY_ID` and `KALSHI_PRIVATE_KEY_PATH`; see
-//! [`KalshiConfig::from_env`] for the optional variables.
+//! Takes the same flags and environment variables as the service itself;
+//! run with `--help`.
 
-use engineering_challenge::kalshi::{Kalshi, KalshiConfig};
+use clap::Parser;
+use engineering_challenge::kalshi::{Kalshi, KalshiConfig, Options};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     engineering_challenge::logging::init();
-    let (mut kalshi, changes) = Kalshi::new(KalshiConfig::from_env()?)?;
+    let (mut kalshi, changes) = Kalshi::new(KalshiConfig::from_options(Options::parse())?)?;
     std::thread::spawn(move || {
         for change in changes {
             println!("{change:?}");

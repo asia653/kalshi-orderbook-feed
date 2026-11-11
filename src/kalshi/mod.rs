@@ -30,7 +30,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use crossbeam::channel::{Receiver, Sender, unbounded};
@@ -120,6 +120,55 @@ pub struct KalshiConfig {
     pub status_interval: Option<Duration>,
 }
 
+const DEFAULT_CONNECTIONS: usize = 2;
+const DEFAULT_GROUPS: usize = 1;
+const DEFAULT_SNAPSHOT_WINDOW: usize = 5_000;
+
+/// Which Kalshi to talk to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Environment {
+    Demo,
+    Prod,
+}
+
+/// What can be set when the service is started, each as a flag or as the
+/// environment variable named beside it. A flag wins over its variable.
+#[derive(Debug, clap::Parser)]
+#[command(about = "Follows Kalshi order books and writes them to stdout as SBE messages")]
+pub struct Options {
+    /// Which Kalshi to talk to
+    #[arg(long = "env", env = "KALSHI_ENV", value_enum, default_value = "demo")]
+    pub environment: Environment,
+    /// The id of the API key
+    #[arg(long, env = "KALSHI_API_KEY_ID", hide_env_values = true)]
+    pub api_key_id: String,
+    /// The PEM file holding the API key's private key
+    #[arg(long, env = "KALSHI_PRIVATE_KEY_PATH", hide_env_values = true)]
+    pub private_key_path: std::path::PathBuf,
+    /// Follow only this series, e.g. KXBTCD; every market when not given
+    #[arg(long, env = "KALSHI_SERIES_TICKER")]
+    pub series_ticker: Option<String>,
+    /// WebSockets per group: one source, the rest standbys
+    #[arg(long, env = "KALSHI_CONNECTIONS", default_value_t = DEFAULT_CONNECTIONS)]
+    pub connections: usize,
+    /// Groups to divide the symbols into, each with its own connections
+    #[arg(long, env = "KALSHI_GROUPS", default_value_t = DEFAULT_GROUPS)]
+    pub groups: usize,
+    /// The most books one connection may have asked for and still be
+    /// waiting on while it loads
+    #[arg(long, env = "KALSHI_SNAPSHOT_WINDOW", default_value_t = DEFAULT_SNAPSHOT_WINDOW)]
+    pub snapshot_window: usize,
+    /// Seconds between status lines; 0 for none
+    #[arg(long, env = "KALSHI_STATUS_SECONDS", default_value_t = 5)]
+    pub status_seconds: u64,
+    /// Use this REST address instead of the environment's
+    #[arg(long, env = "KALSHI_REST_URL")]
+    pub rest_url: Option<String>,
+    /// Use this WebSocket address instead of the environment's
+    #[arg(long, env = "KALSHI_WS_URL")]
+    pub ws_url: Option<String>,
+}
+
 /// When a connection counts as unhealthy.
 #[derive(Debug, Clone)]
 pub struct Health {
@@ -183,59 +232,37 @@ impl KalshiConfig {
             series_ticker: None,
             reconcile_interval: Duration::from_secs(300),
             snapshot_interval: Duration::from_secs(60),
-            connections: 2,
-            groups: 1,
-            snapshot_window: 5_000,
+            connections: DEFAULT_CONNECTIONS,
+            groups: DEFAULT_GROUPS,
+            snapshot_window: DEFAULT_SNAPSHOT_WINDOW,
             health: Health::default(),
             status_interval: None,
         }
     }
 
-    /// Reads `KALSHI_ENV` (`demo` by default, or `prod`), `KALSHI_API_KEY_ID`
-    /// and `KALSHI_PRIVATE_KEY_PATH`. Optional:
-    ///
-    /// * `KALSHI_SERIES_TICKER`: only follow this series.
-    /// * `KALSHI_CONNECTIONS` (2) and `KALSHI_GROUPS` (1): see the fields.
-    /// * `KALSHI_SNAPSHOT_WINDOW` (5000): see the field.
-    /// * `KALSHI_STATUS_SECONDS` (5): how often to print a status line; 0
-    ///   for never.
-    /// * `KALSHI_REST_URL` and `KALSHI_WS_URL`: override the environment's.
-    pub fn from_env() -> anyhow::Result<Self> {
-        let mut config = match std::env::var("KALSHI_ENV").as_deref() {
-            Ok("prod") => Self::prod(),
-            Ok("demo") | Err(_) => Self::demo(),
-            Ok(other) => bail!("KALSHI_ENV must be `demo` or `prod`, got `{other}`"),
+    /// The configuration that `options` describe. Reads the private key
+    /// file they name.
+    pub fn from_options(options: Options) -> anyhow::Result<Self> {
+        let mut config = match options.environment {
+            Environment::Demo => Self::demo(),
+            Environment::Prod => Self::prod(),
         };
-        let key_id = std::env::var("KALSHI_API_KEY_ID").context("KALSHI_API_KEY_ID not set")?;
-        let key_path =
-            std::env::var("KALSHI_PRIVATE_KEY_PATH").context("KALSHI_PRIVATE_KEY_PATH not set")?;
-        let pem = std::fs::read_to_string(&key_path)
-            .with_context(|| format!("reading private key at {key_path}"))?;
-        config.credentials = Some((key_id, pem));
-        config.series_ticker = std::env::var("KALSHI_SERIES_TICKER").ok();
-        let number = |name: &str| -> anyhow::Result<Option<u64>> {
-            match std::env::var(name) {
-                Ok(text) => Ok(Some(text.parse().with_context(|| format!("{name} must be a number"))?)),
-                Err(_) => Ok(None),
-            }
+        let pem = std::fs::read_to_string(&options.private_key_path)
+            .with_context(|| format!("reading private key at {}", options.private_key_path.display()))?;
+        config.credentials = Some((options.api_key_id, pem));
+        // A variable that is set but empty means "not set".
+        config.series_ticker = options.series_ticker.filter(|series| !series.is_empty());
+        config.connections = options.connections;
+        config.groups = options.groups;
+        config.snapshot_window = options.snapshot_window;
+        config.status_interval = match options.status_seconds {
+            0 => None,
+            seconds => Some(Duration::from_secs(seconds)),
         };
-        if let Some(connections) = number("KALSHI_CONNECTIONS")? {
-            config.connections = connections as usize;
-        }
-        if let Some(groups) = number("KALSHI_GROUPS")? {
-            config.groups = groups as usize;
-        }
-        if let Some(window) = number("KALSHI_SNAPSHOT_WINDOW")? {
-            config.snapshot_window = window as usize;
-        }
-        config.status_interval = match number("KALSHI_STATUS_SECONDS")? {
-            Some(0) => None,
-            seconds => Some(Duration::from_secs(seconds.unwrap_or(5))),
-        };
-        if let Ok(url) = std::env::var("KALSHI_REST_URL") {
+        if let Some(url) = options.rest_url {
             config.rest_url = url;
         }
-        if let Ok(url) = std::env::var("KALSHI_WS_URL") {
+        if let Some(url) = options.ws_url {
             config.ws_url = url;
         }
         Ok(config)
