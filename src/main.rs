@@ -13,6 +13,7 @@ use tokio::signal::unix::{SignalKind, signal};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
+    engineering_challenge::logging::init();
     let mut sigint = signal(SignalKind::interrupt())?;
     let sigusr1 = signal(SignalKind::user_defined1())?;
     let drop_source = Box::pin(futures_util::stream::unfold(sigusr1, |mut signal| async move {
@@ -33,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
             bail!("the output stopped while Kalshi was still running");
         }
     }
-    eprintln!("shutting down: websockets closed, closing the output");
+    tracing::info!("shutting down: websockets closed, closing the output");
 
     // Dropping `kalshi` closes the event channel. The writer finishes what
     // is queued, writes its last chunk, and closes the file.

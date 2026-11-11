@@ -8,6 +8,7 @@ use engineering_challenge::kalshi::{Kalshi, KalshiConfig};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
+    engineering_challenge::logging::init();
     let (mut kalshi, changes) = Kalshi::new(KalshiConfig::from_env()?)?;
     std::thread::spawn(move || {
         for change in changes {

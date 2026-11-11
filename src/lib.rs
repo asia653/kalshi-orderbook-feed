@@ -1,4 +1,5 @@
 pub mod kalshi;
+pub mod logging;
 pub mod output;
 pub mod util;
 

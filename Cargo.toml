@@ -6,8 +6,10 @@ build = "src/util/build.rs"
 
 [dependencies]
 anyhow = "1"
+backon = { version = "1", default-features = false, features = ["std", "tokio-sleep"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
 crossbeam = "0.8.4"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 rand = "0.8"
@@ -18,10 +20,13 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "net", "rt", "signal", "time"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["io-util", "sync"] }
+wiremock = "0.6"
 
 [build-dependencies]
 ergo-sbe = "=0.1.16"

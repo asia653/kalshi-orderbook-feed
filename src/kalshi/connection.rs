@@ -29,6 +29,7 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tracing::{info, warn};
 
 use super::book::{Book, BookChange};
 use super::symbols::{LifecycleEvent, SymbolChange};
@@ -406,7 +407,7 @@ impl Connection {
             }
         };
         if tokio::time::timeout(CLOSE_TIMEOUT, handshake).await.is_err() {
-            eprintln!("kalshi[{}]: no close acknowledgement; dropping the connection", self.name);
+            warn!("[{}] no close acknowledgement; dropping the connection", self.name);
         }
     }
 
@@ -581,8 +582,8 @@ impl Connection {
     /// given up and the next books are asked for.
     fn on_stall(&mut self) {
         if self.stalled_at().is_some_and(|at| at <= tokio::time::Instant::now()) {
-            eprintln!(
-                "kalshi[{}]: {} books asked for have sent no snapshot in {:?}; asking for the next ones",
+            warn!(
+                "[{}] {} books asked for have sent no snapshot in {:?}; asking for the next ones",
                 self.name,
                 self.asked.len(),
                 self.stalled_after,
@@ -639,8 +640,8 @@ impl Connection {
         if let (Some(sid), Some(seq)) = (frame.sid, frame.seq) {
             let last = self.last_seq.get(&sid).copied();
             if let (true, Some(last)) = (self.is_gap(sid, seq), last) {
-                eprintln!(
-                    "kalshi[{}]: sequence gap on subscription {sid}: expected {}, got {seq} ({})",
+                warn!(
+                    "[{}] sequence gap on subscription {sid}: expected {}, got {seq} ({})",
                     self.name,
                     last + 1,
                     frame.body.kind(),
@@ -660,7 +661,7 @@ impl Connection {
         match frame.body {
             Body::Lifecycle(event) => self.heard.push_back(Heard::Lifecycle(event)),
             Body::Subscribed { channel, sid } => {
-                eprintln!("kalshi[{}]: subscribed to {channel} as subscription {sid}", self.name);
+                info!("[{}] subscribed to {channel} as subscription {sid}", self.name);
                 if channel == BOOK_CHANNEL {
                     self.learn_book_sid(sid);
                 }
@@ -692,7 +693,7 @@ impl Connection {
                     let applied = book.on_delta(delta, &mut changes);
                     self.report(&symbol, changes, received_at, exchange_timestamp);
                     if let Err(error) = applied {
-                        eprintln!("kalshi[{}]: {symbol}: {error:#}; requesting a snapshot", self.name);
+                        warn!("[{}] {symbol}: {error:#}; requesting a snapshot", self.name);
                         self.to_refresh.insert(symbol);
                         self.release();
                     }
@@ -741,7 +742,7 @@ impl Connection {
             .map(|(symbol, _)| symbol.clone())
             .collect();
         stale.sort();
-        eprintln!("kalshi[{}]: re-fetching {} books after a sequence gap", self.name, stale.len());
+        info!("[{}] re-fetching {} books after a sequence gap", self.name, stale.len());
         stale
     }
 

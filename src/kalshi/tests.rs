@@ -338,6 +338,8 @@ async fn against_mocks_with(
 ) -> (Kalshi, Receiver<Event>, TcpListener, TcpListener) {
     let rest = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let websocket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    // Log lines are shown for a test that fails, or with `--nocapture`.
+    let _ = tracing_subscriber::fmt().with_test_writer().with_target(false).try_init();
     let mut config = KalshiConfig::demo();
     config.rest_url = format!("http://{}/trade-api/v2", rest.local_addr().unwrap());
     config.ws_url = format!("ws://{}/trade-api/ws/v2", websocket.local_addr().unwrap());

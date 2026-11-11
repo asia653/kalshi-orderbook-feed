@@ -44,6 +44,7 @@ use rsa::pss::BlindedSigningKey;
 use rsa::signature::{RandomizedSigner, SignatureEncoding};
 use serde::Deserialize;
 use sha2::Sha256;
+use tracing::{info, warn};
 
 pub use book::Level;
 pub use symbols::SymbolChange;
@@ -428,7 +429,7 @@ impl Kalshi {
                 Some(()) = drop_source.next() => {
                     // The first group's source: one cut is enough to watch.
                     let source = self.sources[0];
-                    eprintln!("kalshi: dropping connection {} on request", self.connections[source].name());
+                    info!("dropping connection {} on request", self.connections[source].name());
                     self.connections[source].drop_socket("dropped on request");
                 }
                 open = async { fetch.as_mut().expect("guarded").await }, if fetching => {
@@ -492,7 +493,7 @@ impl Kalshi {
                 }
             }
             Heard::Lost(error) => {
-                eprintln!("kalshi[{}]: connection lost: {error:#}", self.connections[index].name());
+                warn!("[{}] connection lost: {error:#}", self.connections[index].name());
                 if index == self.lead {
                     let open = (0..self.connections.len()).find(|&i| self.connections[i].is_open());
                     self.follow_lead(open.unwrap_or(index));
@@ -517,7 +518,7 @@ impl Kalshi {
             Heard::Book(_) => {}
             Heard::Unhandled { kind, raw } => {
                 if self.unhandled.insert(kind.clone()) {
-                    eprintln!("kalshi: not handling `{kind}` messages; the first one: {raw}");
+                    warn!("not handling `{kind}` messages; the first one: {raw}");
                 }
             }
         }
@@ -551,8 +552,8 @@ impl Kalshi {
     /// snapshot of each book replaces whatever the old source said.
     fn switch_source(&mut self, group: usize, next: usize) {
         let old = std::mem::replace(&mut self.sources[group], next);
-        eprintln!(
-            "kalshi: the source is now connection {} (was {})",
+        info!(
+            "the source is now connection {} (was {})",
             self.connections[next].name(),
             self.connections[old].name()
         );
@@ -582,7 +583,7 @@ impl Kalshi {
     }
 
     fn distrust_symbols(&mut self, error: anyhow::Error) {
-        eprintln!("kalshi: the symbol list is out of sync: {error:#}; fetching it again");
+        warn!("the symbol list is out of sync: {error:#}; fetching it again");
         self.symbols_stale = true;
     }
 
@@ -708,7 +709,7 @@ impl Kalshi {
         let seconds = std::mem::replace(&mut self.status_at, Instant::now()).elapsed().as_secs_f64().max(0.001);
         let late = seconds - interval;
         let mut line = format!(
-            "kalshi: {} symbols, {:.0} events/s written",
+            "{} symbols, {:.0} events/s written",
             self.symbols.state().len(),
             std::mem::take(&mut self.published) as f64 / seconds,
         );
@@ -751,9 +752,10 @@ impl Kalshi {
             }
         }
         if late > 1.0 {
-            line += &format!(" | this line is {late:.1} s late: the service is not keeping up");
+            warn!("{line} | this line is {late:.1} s late: the service is not keeping up");
+        } else {
+            info!("{line}");
         }
-        eprintln!("{line}");
     }
 
     // ---- publishing -------------------------------------------------------
@@ -773,7 +775,7 @@ impl Kalshi {
         // it takes long enough to matter.
         let took = started.elapsed();
         if took > Duration::from_millis(250) {
-            eprintln!("kalshi: the snapshot of {count} books held everything else up for {took:.0?}");
+            warn!("the snapshot of {count} books held everything else up for {took:.0?}");
         }
         // Keep a steady cadence, unless we have fallen a whole interval behind.
         let now = tokio::time::Instant::now();
@@ -855,7 +857,7 @@ async fn fetch_open_markets(
         match page_open_markets(&http, &auth, &url, series.as_deref()).await {
             Ok(open) => return open,
             Err(error) => {
-                eprintln!("kalshi: fetching the open markets failed: {error:#}; trying again in {pause:?}");
+                warn!("fetching the open markets failed: {error:#}; trying again in {pause:?}");
                 tokio::time::sleep(pause).await;
                 pause = (pause * 2).min(MAX_FETCH_PAUSE);
             }
@@ -896,7 +898,7 @@ async fn page_open_markets(
             if response.status() != StatusCode::TOO_MANY_REQUESTS {
                 break response;
             }
-            eprintln!("kalshi: REST rate limit reached; asking again in {pause:?}");
+            warn!("REST rate limit reached; asking again in {pause:?}");
             tokio::time::sleep(pause).await;
             pause = (pause * 2).min(MAX_RATE_LIMIT_PAUSE);
         };
