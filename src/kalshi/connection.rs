@@ -181,6 +181,9 @@ pub(super) struct Connection {
     /// Health checks in a row that found this connection quiet. Its owner
     /// keeps count here.
     pub(super) strikes: u32,
+    /// Health checks in a row that found this connection lagging behind the
+    /// fastest of its group. Its owner keeps count here.
+    pub(super) slow_checks: u32,
     ws_url: String,
     auth: Option<Arc<Auth>>,
     link: Link,
@@ -230,6 +233,7 @@ impl Connection {
             dead_after,
             vitals: Vitals::new(),
             strikes: 0,
+            slow_checks: 0,
             ws_url,
             auth,
             link: Link::Waiting(tokio::time::Instant::now()),
@@ -393,6 +397,7 @@ impl Connection {
         self.catching_up.clear();
         self.in_sync = false;
         self.strikes = 0;
+        self.slow_checks = 0;
         self.subscribed.clear();
         self.book_sid = None;
         self.deferred.clear();

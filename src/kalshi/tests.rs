@@ -662,11 +662,10 @@ async fn a_quiet_source_is_cut_and_the_standby_takes_over() {
 }
 
 #[tokio::test]
-async fn a_lagging_source_hands_over_but_stays_connected() {
+async fn a_lagging_source_hands_over_and_reconnects() {
     let (mut kalshi, events, rest, websocket) = against_mocks_with(|config| {
         config.connections = 2;
         config.health.check_every = Duration::from_millis(50);
-        config.health.lag_dwell = Duration::ZERO;
     })
     .await;
     tokio::spawn(mock_rest(rest));
@@ -679,19 +678,31 @@ async fn a_lagging_source_hands_over_but_stays_connected() {
     let timed = |seq: u64, sent_ms: i64| {
         let mut message = delta(seq, "A", 98 + seq as i64, "-0.01");
         message["sending_ts_ms"] = json!(sent_ms);
-        message
+        Message::Text(message.to_string().into())
     };
+    let mut hung_up = false;
     for seq in 3..40 {
-        send(&mut pair.source, timed(seq, now_ms() - 2_000)).await;
-        send(&mut pair.standby, timed(seq, now_ms())).await;
+        // Sending to the slow socket fails once the service has cut it.
+        hung_up |= pair.source.send(timed(seq, now_ms() - 2_000)).await.is_err();
+        pair.standby.send(timed(seq, now_ms())).await.unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    // B never changed, so its snapshot tells the two sockets apart.
+    // B never changed, so its snapshot tells the two sockets apart: the
+    // fast connection's books were published when it became the source.
     while !pair.seen[4..].contains(&snapshot_event("B", b)) {
         pair.wait_for(pair.seen.len() + 1).await;
     }
-    let still_open = tokio::time::timeout(Duration::from_millis(200), pair.source.next()).await;
-    assert!(still_open.is_err(), "a lagging connection is kept as the standby, got {still_open:?}");
+    // The slow socket is not kept: it is cut, and a new one is opened.
+    if !hung_up {
+        expect_hang_up(&mut pair.source).await;
+    }
+    let mut again = tokio::time::timeout(Duration::from_secs(5), accept(&websocket))
+        .await
+        .expect("the lagging connection should connect again");
+    assert_eq!(next_command(&mut again).await["params"]["channels"], json!(["market_lifecycle_v2"]));
+    // The fast connection was left alone throughout.
+    let untouched = tokio::time::timeout(Duration::from_millis(200), pair.standby.next()).await;
+    assert!(untouched.is_err(), "the fast connection should stay open, got {untouched:?}");
     client.abort();
 }
 

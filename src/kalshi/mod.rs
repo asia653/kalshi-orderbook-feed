@@ -131,11 +131,13 @@ pub struct Health {
     /// deltas, and for at least `silence_floor`.
     pub silence_floor: Duration,
     pub silence_factor: u32,
-    /// The source is lagging when its messages are this much more delayed
-    /// than another connection's, for `lag_checks` checks in a row.
+    /// A connection is lagging when its messages are this much more delayed
+    /// than those of the fastest connection following the same symbols, for
+    /// `lag_checks` checks in a row. It is cut and connects again.
     pub lag_margin: Duration,
     pub lag_checks: u32,
-    /// After a switch for lag, how long before another is considered.
+    /// After a connection is cut for lag, how long before another of its
+    /// group can be.
     pub lag_dwell: Duration,
 }
 
@@ -247,8 +249,8 @@ pub struct Kalshi {
     connections: Vec<Connection>,
     /// For each group, the connection whose books are published.
     sources: Vec<usize>,
-    /// For each group, how the source's delay compares with the others'.
-    lagging: Vec<Lagging>,
+    /// For each group, when one of its connections was last cut for lag.
+    lag_cut_at: Vec<Option<tokio::time::Instant>>,
     /// The connection whose lifecycle messages are applied. It only needs
     /// to be open, and can be in any group: lifecycle messages are the same
     /// on every socket.
@@ -259,13 +261,6 @@ pub struct Kalshi {
     published: u64,
     /// Message types we do not handle and have already logged once.
     unhandled: HashSet<String>,
-}
-
-struct Lagging {
-    /// Health checks in a row that found the source lagging.
-    checks: u32,
-    /// When the source was last changed because of lag.
-    switched_at: Option<tokio::time::Instant>,
 }
 
 /// Which group follows `symbol`. All markets of one event land in the same
@@ -316,7 +311,7 @@ impl Kalshi {
         for &source in &sources {
             connections[source].set_reporting(true);
         }
-        let lagging = (0..config.groups).map(|_| Lagging { checks: 0, switched_at: None }).collect();
+        let lag_cut_at = vec![None; config.groups];
         let kalshi = Self {
             config,
             auth,
@@ -329,7 +324,7 @@ impl Kalshi {
             next_snapshot,
             connections,
             sources,
-            lagging,
+            lag_cut_at,
             lead: 0,
             turn: 0,
             published: 0,
@@ -505,7 +500,6 @@ impl Kalshi {
         eprintln!("kalshi: the source is now connection {next} (was {old})");
         self.connections[old].set_reporting(false);
         self.connections[next].set_reporting(true);
-        self.lagging[group].checks = 0;
         let mut books = self.books_of(next, Utc::now());
         books.sort_by(|a, b| a.0.cmp(&b.0));
         for (_, event) in books {
@@ -597,9 +591,11 @@ impl Kalshi {
                 }
             }
 
-            // A source that delivers late. It stays connected, as the
-            // standby: being late is not being wrong.
-            let source = self.sources[group];
+            // A connection that delivers late. Kalshi's side of that socket
+            // is taken to be the slow part, so it is cut and connects again;
+            // if it was the source, the fastest connection takes over first.
+            // The fastest is never cut, and only one connection per
+            // `lag_dwell`, so a group is not emptied by this.
             let lags: Vec<(usize, f64)> = members
                 .clone()
                 .filter_map(|index| {
@@ -610,29 +606,35 @@ impl Kalshi {
                     connection.in_sync().then_some((index, lag?))
                 })
                 .collect();
-            let source_lag = lags.iter().find(|(index, _)| *index == source).map(|(_, lag)| *lag);
-            let fastest = lags
-                .iter()
-                .filter(|(index, _)| *index != source)
-                .min_by(|a, b| a.1.total_cmp(&b.1))
-                .copied();
+            // No verdict without numbers from two connections: against our
+            // own clock alone, a delay could as well be the clock.
+            if lags.len() < 2 {
+                continue;
+            }
+            let (fastest, fastest_lag) =
+                lags.iter().copied().min_by(|a, b| a.1.total_cmp(&b.1)).expect("there are two");
             let margin = health.lag_margin.as_secs_f64() * 1000.0;
-            let lagging = &mut self.lagging[group];
-            match (source_lag, fastest) {
-                (Some(source_lag), Some((fastest, lag))) if source_lag - lag > margin => {
-                    lagging.checks += 1;
-                    let settled = lagging.switched_at.is_none_or(|at| now - at >= health.lag_dwell);
-                    if lagging.checks >= health.lag_checks && settled {
-                        eprintln!(
-                            "kalshi[{source}]: lagging: {source_lag:.0} ms behind Kalshi against {lag:.0} ms on connection {fastest}"
-                        );
-                        lagging.switched_at = Some(now);
-                        self.switch_source(group, fastest);
-                    }
+            let mut slowest: Option<(usize, f64)> = None;
+            for &(index, lag) in &lags {
+                let connection = &mut self.connections[index];
+                if lag - fastest_lag <= margin {
+                    connection.slow_checks = 0;
+                    continue;
                 }
-                // No verdict without numbers from both sides.
-                (Some(_), Some(_)) => lagging.checks = 0,
-                _ => {}
+                connection.slow_checks += 1;
+                if connection.slow_checks >= health.lag_checks && slowest.is_none_or(|(_, worst)| lag > worst) {
+                    slowest = Some((index, lag));
+                }
+            }
+            let settled = self.lag_cut_at[group].is_none_or(|at| now - at >= health.lag_dwell);
+            if let (Some((slow, lag)), true) = (slowest, settled) {
+                self.lag_cut_at[group] = Some(now);
+                if self.sources[group] == slow {
+                    self.switch_source(group, fastest);
+                }
+                self.connections[slow].drop_socket(&format!(
+                    "lagging: {lag:.0} ms behind Kalshi against {fastest_lag:.0} ms on connection {fastest}"
+                ));
             }
         }
     }
