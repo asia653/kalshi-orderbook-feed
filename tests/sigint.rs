@@ -18,11 +18,12 @@ use rsa::pss::{Signature, VerifyingKey};
 use rsa::signature::Verifier;
 use serde_json::{Value, json};
 use sha2::Sha256;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const CHUNK: u64 = 64 << 20;
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -38,22 +39,13 @@ impl Drop for Service {
 }
 
 /// Serves one open market, "A", to every request.
-async fn mock_rest(listener: TcpListener) {
-    loop {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = Vec::new();
-        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-            let mut chunk = [0u8; 1024];
-            let n = stream.read(&mut chunk).await.unwrap();
-            request.extend_from_slice(&chunk[..n]);
-        }
-        let body = r#"{"markets":[{"ticker":"A","close_time":"2099-01-01T00:00:00Z"}],"cursor":""}"#;
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(response.as_bytes()).await.unwrap();
-    }
+async fn mock_rest(rest: &MockServer) {
+    let markets = json!({"markets": [{"ticker": "A", "close_time": "2099-01-01T00:00:00Z"}], "cursor": ""});
+    Mock::given(method("GET"))
+        .and(path("/trade-api/v2/markets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(markets))
+        .mount(rest)
+        .await;
 }
 
 async fn next_command(ws: &mut WebSocketStream<TcpStream>) -> Value {
@@ -74,11 +66,11 @@ async fn sigint_closes_the_websocket_and_the_output() {
 }
 
 async fn scenario() {
-    let rest = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rest = MockServer::start().await;
+    mock_rest(&rest).await;
     let websocket = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let rest_url = format!("http://{}/trade-api/v2", rest.local_addr().unwrap());
+    let rest_url = format!("{}/trade-api/v2", rest.uri());
     let ws_url = format!("ws://{}/trade-api/ws/v2", websocket.local_addr().unwrap());
-    tokio::spawn(mock_rest(rest));
 
     // A throwaway key, so the service signs its requests as it would for real.
     let key = RsaPrivateKey::new(&mut rand::thread_rng(), 1024).unwrap();
@@ -125,6 +117,10 @@ async fn scenario() {
     let command = next_command(&mut ws).await;
     assert_eq!(command["params"]["channels"], json!(["orderbook_delta"]));
     assert_eq!(command["params"]["market_tickers"], json!(["A"]));
+    // The symbol list came from REST, and that request was signed as well.
+    let fetched = rest.received_requests().await.unwrap();
+    assert_eq!(fetched[0].headers["KALSHI-ACCESS-KEY"], "test-key-id");
+    assert!(fetched[0].headers.contains_key("KALSHI-ACCESS-SIGNATURE"));
 
     send(&mut ws, json!({"type": "orderbook_snapshot", "sid": 2, "seq": 1, "sending_ts_ms": 1_700_000_000_000_i64,
         "msg": {"market_ticker": "A", "clock": 100,

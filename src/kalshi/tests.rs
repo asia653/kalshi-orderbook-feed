@@ -5,10 +5,11 @@ use std::time::Instant;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
+use wiremock::matchers::{method, path, query_param};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::book::{Book, BookSide, BookSnapshot, ONE};
 use super::wire::{Body, parse_message};
@@ -118,60 +119,39 @@ fn every_book_in_sync_is_published_each_interval() {
 }
 
 /// Serves one page of open markets, "A" and "B", to every request.
-async fn mock_rest(listener: TcpListener) {
-    serve_markets(listener, vec!["A".to_owned(), "B".to_owned()]).await
+async fn mock_rest(rest: &MockServer) {
+    serve_markets(rest, vec!["A".to_owned(), "B".to_owned()]).await
 }
 
-/// Serves `tickers` as one page of open markets to every request.
-async fn serve_markets(listener: TcpListener, tickers: Vec<String>) {
+/// Serves `tickers` as one page of open markets to every request that
+/// leaves out MVEs, as every request must.
+async fn serve_markets(rest: &MockServer, tickers: Vec<String>) {
     let markets: Vec<Value> =
         tickers.iter().map(|ticker| json!({"ticker": ticker, "close_time": "2099-01-01T00:00:00Z"})).collect();
-    let body = json!({"markets": markets, "cursor": ""}).to_string();
-    loop {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = Vec::new();
-        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-            let mut chunk = [0u8; 1024];
-            let n = stream.read(&mut chunk).await.unwrap();
-            request.extend_from_slice(&chunk[..n]);
-        }
-        let request = String::from_utf8_lossy(&request);
-        assert!(request.contains("mve_filter=exclude"), "MVEs must be excluded: {request}");
-        let head = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-            body.len()
-        );
-        stream.write_all(head.as_bytes()).await.unwrap();
-        stream.write_all(body.as_bytes()).await.unwrap();
-    }
+    Mock::given(method("GET"))
+        .and(path("/trade-api/v2/markets"))
+        .and(query_param("mve_filter", "exclude"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"markets": markets, "cursor": ""})))
+        .mount(rest)
+        .await;
 }
 
 #[tokio::test]
 async fn a_rate_limited_page_is_asked_for_again() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = reqwest::Url::parse(&format!("http://{}/trade-api/v2/markets", listener.local_addr().unwrap())).unwrap();
-    let served = tokio::spawn(async move {
-        let body = r#"{"markets":[{"ticker":"A","close_time":"2099-01-01T00:00:00Z"}],"cursor":""}"#;
-        let ok = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let limited = "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned();
-        for response in [limited, ok] {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                let mut chunk = [0u8; 1024];
-                let n = stream.read(&mut chunk).await.unwrap();
-                request.extend_from_slice(&chunk[..n]);
-            }
-            stream.write_all(response.as_bytes()).await.unwrap();
-        }
-    });
+    let rest = MockServer::start().await;
+    // The first request is told to slow down; the second is answered.
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(429))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&rest)
+        .await;
+    serve_markets(&rest, vec!["A".to_owned()]).await;
+    let url = reqwest::Url::parse(&format!("{}/trade-api/v2/markets", rest.uri())).unwrap();
 
     let open = page_open_markets(&reqwest::Client::new(), &None, &url, None).await.unwrap();
     assert_eq!(open.markets.keys().collect::<Vec<_>>(), ["A"]);
-    served.await.unwrap();
+    assert_eq!(rest.received_requests().await.unwrap().len(), 2);
 }
 
 type ServerWs = WebSocketStream<TcpStream>;
@@ -278,7 +258,7 @@ fn summarize(event: Event) -> String {
 #[tokio::test]
 async fn stays_in_sync_with_a_mock_kalshi() {
     let (mut kalshi, events, rest, websocket) = against_mocks(1).await;
-    tokio::spawn(mock_rest(rest));
+    mock_rest(&rest).await;
     let script = tokio::spawn(mock_websocket(websocket));
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let client = tokio::spawn(async move {
@@ -329,19 +309,19 @@ async fn stays_in_sync_with_a_mock_kalshi() {
 }
 
 /// A `Kalshi` pointed at mocks on localhost, and the two listeners.
-async fn against_mocks(connections: usize) -> (Kalshi, Receiver<Event>, TcpListener, TcpListener) {
+async fn against_mocks(connections: usize) -> (Kalshi, Receiver<Event>, MockServer, TcpListener) {
     against_mocks_with(|config| config.connections = connections).await
 }
 
 async fn against_mocks_with(
     adjust: impl FnOnce(&mut KalshiConfig),
-) -> (Kalshi, Receiver<Event>, TcpListener, TcpListener) {
-    let rest = TcpListener::bind("127.0.0.1:0").await.unwrap();
+) -> (Kalshi, Receiver<Event>, MockServer, TcpListener) {
+    let rest = MockServer::start().await;
     let websocket = TcpListener::bind("127.0.0.1:0").await.unwrap();
     // Log lines are shown for a test that fails, or with `--nocapture`.
     let _ = tracing_subscriber::fmt().with_test_writer().with_target(false).try_init();
     let mut config = KalshiConfig::demo();
-    config.rest_url = format!("http://{}/trade-api/v2", rest.local_addr().unwrap());
+    config.rest_url = format!("{}/trade-api/v2", rest.uri());
     config.ws_url = format!("ws://{}/trade-api/ws/v2", websocket.local_addr().unwrap());
     config.connections = 1;
     adjust(&mut config);
@@ -357,7 +337,7 @@ async fn accept(listener: &TcpListener) -> ServerWs {
 #[tokio::test]
 async fn a_lost_connection_is_reopened_and_resubscribed() {
     let (mut kalshi, events, rest, websocket) = against_mocks(1).await;
-    tokio::spawn(mock_rest(rest));
+    mock_rest(&rest).await;
     let script = tokio::spawn(async move {
         let mut ws = accept(&websocket).await;
         assert_eq!(next_command(&mut ws).await["params"]["channels"], json!(["market_lifecycle_v2"]));
@@ -416,7 +396,7 @@ async fn a_lost_connection_is_reopened_and_resubscribed() {
 async fn many_symbols_are_subscribed_in_batches_in_order() {
     let (mut kalshi, _events, rest, websocket) = against_mocks(1).await;
     let tickers: Vec<String> = (0..1200).map(|n| format!("M{n:04}")).collect();
-    tokio::spawn(serve_markets(rest, tickers.clone()));
+    serve_markets(&rest, tickers.clone()).await;
     let script = tokio::spawn(async move {
         let mut ws = accept(&websocket).await;
         assert_eq!(next_command(&mut ws).await["params"]["channels"], json!(["market_lifecycle_v2"]));
@@ -446,7 +426,7 @@ async fn books_are_asked_for_as_fast_as_snapshots_arrive() {
         })
         .await;
     let tickers: Vec<String> = (0..3_500).map(|n| format!("M{n:04}")).collect();
-    tokio::spawn(serve_markets(rest, tickers.clone()));
+    serve_markets(&rest, tickers.clone()).await;
     let script = tokio::spawn(async move {
         let mut ws = accept(&websocket).await;
         assert_eq!(next_command(&mut ws).await["params"]["channels"], json!(["market_lifecycle_v2"]));
@@ -495,7 +475,7 @@ async fn unsent_commands_do_not_stop_messages_being_read() {
     // about 18 MB, more than the socket buffers between the two ends can
     // hold.
     let tickers: Vec<String> = (0..2_000).map(|n| format!("M{n:05}-{}", "X".repeat(9_000))).collect();
-    tokio::spawn(serve_markets(rest, tickers));
+    serve_markets(&rest, tickers).await;
     let (go, gone) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
         let mut ws = accept(&websocket).await;
@@ -586,7 +566,7 @@ fn snapshot_event(symbol: &str, contracts: i64) -> String {
 #[tokio::test]
 async fn the_standby_takes_over_when_the_source_is_cut() {
     let (mut kalshi, events, rest, websocket) = against_mocks(2).await;
-    tokio::spawn(mock_rest(rest));
+    mock_rest(&rest).await;
     let (cut, cuts) = tokio::sync::mpsc::unbounded_channel::<()>();
     let cuts = Box::pin(futures_util::stream::unfold(cuts, |mut cuts| async move {
         cuts.recv().await.map(|()| ((), cuts))
@@ -637,7 +617,7 @@ async fn the_standby_takes_over_when_the_source_is_cut() {
 #[tokio::test]
 async fn the_standby_takes_over_when_the_source_misses_a_message() {
     let (mut kalshi, events, rest, websocket) = against_mocks(2).await;
-    tokio::spawn(mock_rest(rest));
+    mock_rest(&rest).await;
     let client = tokio::spawn(async move { kalshi.run(std::future::pending()).await });
     let mut pair = Pair::start(events, &websocket).await;
     let (a, b) = pair.standby_sent;
@@ -693,7 +673,7 @@ async fn a_quiet_source_is_cut_and_the_standby_takes_over() {
         config.health.quiet_after = Duration::from_millis(200);
     })
     .await;
-    tokio::spawn(mock_rest(rest));
+    mock_rest(&rest).await;
     let client = tokio::spawn(async move { kalshi.run(std::future::pending()).await });
     let mut pair = Pair::start(events, &websocket).await;
     let (a, b) = pair.standby_sent;
@@ -716,7 +696,7 @@ async fn a_lagging_source_hands_over_and_reconnects() {
         config.health.check_every = Duration::from_millis(50);
     })
     .await;
-    tokio::spawn(mock_rest(rest));
+    mock_rest(&rest).await;
     let client = tokio::spawn(async move { kalshi.run(std::future::pending()).await });
     let mut pair = Pair::start(events, &websocket).await;
     let (_, b) = pair.standby_sent;
@@ -761,7 +741,7 @@ async fn connections_still_loading_their_books_are_not_judged() {
         config.health.check_every = Duration::from_millis(20);
     })
     .await;
-    tokio::spawn(mock_rest(rest));
+    mock_rest(&rest).await;
     let client = tokio::spawn(async move { kalshi.run(std::future::pending()).await });
 
     // Both sockets open before the symbol list is known, and then load A
@@ -793,7 +773,7 @@ async fn connections_still_loading_their_books_are_not_judged() {
 async fn a_socket_with_no_pings_is_dead() {
     let (mut kalshi, _events, rest, websocket) =
         against_mocks_with(|config| config.health.dead_after = Duration::from_millis(300)).await;
-    tokio::spawn(mock_rest(rest));
+    mock_rest(&rest).await;
     let client = tokio::spawn(async move { kalshi.run(std::future::pending()).await });
 
     // This mock never sends pings, as a dead line would not.
@@ -813,7 +793,7 @@ async fn a_lone_connection_that_falls_silent_reconnects() {
         config.health.silence_factor = 10;
     })
     .await;
-    tokio::spawn(mock_rest(rest));
+    mock_rest(&rest).await;
     let client = tokio::spawn(async move { kalshi.run(std::future::pending()).await });
 
     let mut ws = accept(&websocket).await;
@@ -836,7 +816,7 @@ async fn symbols_are_divided_between_groups_by_event() {
     let (mut kalshi, events, rest, websocket) = against_mocks_with(|config| config.groups = 2).await;
     let tickers: Vec<String> =
         (0..20).flat_map(|event| (0..3).map(move |market| format!("S-E{event:02}-M{market}"))).collect();
-    tokio::spawn(serve_markets(rest, tickers.clone()));
+    serve_markets(&rest, tickers.clone()).await;
     let client = tokio::spawn(async move { kalshi.run(std::future::pending()).await });
 
     let mut asked: Vec<Vec<String>> = Vec::new();
@@ -924,7 +904,7 @@ async fn at_full_scale_every_book_loads() {
     .await;
     // Close times like the real ones: all different, none soon.
     let tickers: Vec<String> = (0..MARKETS).map(|n| format!("KXSCALE-26NOV{:05}-T{n:06}", n / 20)).collect();
-    tokio::spawn(serve_markets(rest, tickers));
+    serve_markets(&rest, tickers).await;
     let client = tokio::spawn(async move { kalshi.run(std::future::pending()).await });
     for _ in 0..2 {
         let mut ws = accept(&websocket).await;
