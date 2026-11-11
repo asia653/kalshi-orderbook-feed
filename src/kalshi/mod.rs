@@ -122,6 +122,9 @@ pub struct Health {
     /// A socket on which nothing arrives for this long, not even one of
     /// Kalshi's 10-second pings, is dead.
     pub dead_after: Duration,
+    /// How long a connection waits for the snapshots it asked for before it
+    /// asks for more books anyway.
+    pub stalled_after: Duration,
     /// A connection that has heard nothing for this long, while another
     /// connection following the same symbols heard a delta, has a quiet
     /// subscription.
@@ -146,6 +149,7 @@ impl Default for Health {
         Self {
             check_every: Duration::from_secs(1),
             dead_after: Duration::from_secs(25),
+            stalled_after: Duration::from_secs(5),
             quiet_after: Duration::from_secs(3),
             silence_floor: Duration::from_secs(30),
             silence_factor: 100,
@@ -324,7 +328,7 @@ impl Kalshi {
         anyhow::ensure!(config.connections >= 1, "at least one connection is needed");
         anyhow::ensure!(config.groups >= 1, "at least one group is needed");
         let mut connections: Vec<Connection> = (0..config.groups * config.connections)
-            .map(|index| Connection::new(connection_name(index, &config), config.ws_url.clone(), auth.clone(), config.health.dead_after))
+            .map(|index| Connection::new(connection_name(index, &config), config.ws_url.clone(), auth.clone(), config.health.dead_after, config.health.stalled_after))
             .collect();
         // Each group starts with its first connection as the source.
         let sources: Vec<usize> = (0..config.groups).map(|group| group * config.connections).collect();

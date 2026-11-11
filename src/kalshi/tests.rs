@@ -433,14 +433,62 @@ async fn many_symbols_are_subscribed_in_batches_in_order() {
     }
 }
 
+/// Asking for every book at once made the real Kalshi reset the connection.
+/// Books are asked for only as fast as their snapshots come back.
+#[tokio::test]
+async fn books_are_asked_for_as_fast_as_snapshots_arrive() {
+    let (mut kalshi, _events, rest, websocket) =
+        against_mocks_with(|config| config.health.stalled_after = Duration::from_millis(400)).await;
+    let tickers: Vec<String> = (0..3_500).map(|n| format!("M{n:04}")).collect();
+    tokio::spawn(serve_markets(rest, tickers.clone()));
+    let script = tokio::spawn(async move {
+        let mut ws = accept(&websocket).await;
+        assert_eq!(next_command(&mut ws).await["params"]["channels"], json!(["market_lifecycle_v2"]));
+        let mut asked: Vec<String> = Vec::new();
+        let mut next_batch = async |ws: &mut ServerWs, within: Duration| -> Option<usize> {
+            let command = tokio::time::timeout(within, ws.next()).await.ok()??.unwrap();
+            let command: Value = serde_json::from_str(command.to_text().unwrap()).unwrap();
+            assert_eq!(command["params"]["skip_ticker_ack"], true);
+            let batch = command["params"]["market_tickers"].as_array().unwrap();
+            asked.extend(batch.iter().map(|ticker| ticker.as_str().unwrap().to_owned()));
+            Some(batch.len())
+        };
+        let soon = Duration::from_millis(200);
+
+        // The first 2,000 are asked for at once, and then no more.
+        for _ in 0..4 {
+            assert_eq!(next_batch(&mut ws, soon).await, Some(500));
+        }
+        assert_eq!(next_batch(&mut ws, soon).await, None, "the rest wait for snapshots");
+
+        // Each 500 snapshots that arrive make room for 500 more books.
+        for (seq, ticker) in tickers[..500].iter().enumerate() {
+            send(&mut ws, snapshot(seq as u64 + 1, ticker, 100, "20.00")).await;
+        }
+        assert_eq!(next_batch(&mut ws, soon).await, Some(500));
+        assert_eq!(next_batch(&mut ws, soon).await, None);
+
+        // Snapshots that never come do not hold the rest up for ever.
+        assert_eq!(next_batch(&mut ws, Duration::from_secs(2)).await, Some(500));
+        assert_eq!(next_batch(&mut ws, soon).await, Some(500));
+        drop(next_batch);
+        assert_eq!(asked, tickers, "every book is asked for once, in order");
+    });
+    tokio::select! {
+        _ = kalshi.run(std::future::pending()) => unreachable!("run only returns on shutdown"),
+        done = tokio::time::timeout(Duration::from_secs(20), script) => done.expect("in time").unwrap(),
+    }
+}
+
 /// Kalshi stops reading while megabytes of subscribe commands are still
 /// waiting to be sent. Messages it sends must still be read and acted on.
 #[tokio::test]
 async fn unsent_commands_do_not_stop_messages_being_read() {
     let (mut kalshi, events, rest, websocket) = against_mocks(1).await;
-    // Long tickers: about 18 MB of subscribe commands, more than the socket
-    // buffers between the two ends can hold.
-    let tickers: Vec<String> = (0..60_000).map(|n| format!("M{n:05}-{}", "X".repeat(290))).collect();
+    // Very long tickers: the first few subscribe commands alone come to
+    // about 18 MB, more than the socket buffers between the two ends can
+    // hold.
+    let tickers: Vec<String> = (0..2_000).map(|n| format!("M{n:05}-{}", "X".repeat(9_000))).collect();
     tokio::spawn(serve_markets(rest, tickers));
     let (go, gone) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
@@ -465,7 +513,7 @@ async fn unsent_commands_do_not_stop_messages_being_read() {
             }
         }
     };
-    let last = format!("M59999-{}", "X".repeat(290));
+    let last = format!("M01999-{}", "X".repeat(9_000));
     tokio::time::timeout(Duration::from_secs(30), wait_for(last))
         .await
         .expect("the symbols should load");

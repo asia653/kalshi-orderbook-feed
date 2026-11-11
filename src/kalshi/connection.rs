@@ -38,6 +38,11 @@ use super::{Auth, Event, auth_headers};
 
 /// Symbols per subscribe / update command.
 const COMMAND_BATCH: usize = 500;
+/// The most books that may be asked for and still be waiting for their
+/// snapshot. Asking for every book at once (hundreds of commands, hundreds
+/// of thousands of snapshots owed) made Kalshi reset the connection; 6,000
+/// at once is known to work.
+const SNAPSHOT_WINDOW: usize = 2_000;
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// The shortest time between two re-fetches of every book. Several sequence
 /// gaps close together are answered with one re-fetch, not one each.
@@ -167,6 +172,7 @@ enum Step {
     Connected(anyhow::Result<Ws>),
     Read(Option<Result<Message, tungstenite::Error>>),
     Refetch,
+    Stalled,
     Dead,
 }
 
@@ -177,6 +183,9 @@ pub(super) struct Connection {
     reporting: bool,
     /// How long nothing at all may arrive before the socket counts as dead.
     dead_after: Duration,
+    /// How long to wait for snapshots that were asked for before asking for
+    /// more anyway.
+    stalled_after: Duration,
     pub(super) vitals: Vitals,
     /// Health checks in a row that found this connection quiet. Its owner
     /// keeps count here.
@@ -211,6 +220,15 @@ pub(super) struct Connection {
     in_sync: bool,
     /// Symbols Kalshi has been asked to send books for.
     subscribed: HashSet<String>,
+    /// Symbols to subscribe to, not yet asked for: see [`SNAPSHOT_WINDOW`].
+    to_subscribe: BTreeSet<String>,
+    /// Subscribed symbols whose snapshot is to be asked for again, not yet
+    /// asked for.
+    to_refresh: BTreeSet<String>,
+    /// Symbols asked for whose snapshot has not arrived yet.
+    asked: HashSet<String>,
+    /// When a snapshot that was asked for last arrived, or more were asked for.
+    progress_at: tokio::time::Instant,
     /// Subscription id of the orderbook channel, once Kalshi has told us.
     book_sid: Option<u64>,
     /// Book commands that need `book_sid` and are waiting for it.
@@ -226,11 +244,18 @@ pub(super) struct Connection {
 
 impl Connection {
     /// A connection that makes its first attempt as soon as it is polled.
-    pub(super) fn new(name: String, ws_url: String, auth: Option<Arc<Auth>>, dead_after: Duration) -> Self {
+    pub(super) fn new(
+        name: String,
+        ws_url: String,
+        auth: Option<Arc<Auth>>,
+        dead_after: Duration,
+        stalled_after: Duration,
+    ) -> Self {
         Self {
             name,
             reporting: false,
             dead_after,
+            stalled_after,
             vitals: Vitals::new(),
             strikes: 0,
             slow_checks: 0,
@@ -246,6 +271,10 @@ impl Connection {
             catching_up: HashSet::new(),
             in_sync: false,
             subscribed: HashSet::new(),
+            to_subscribe: BTreeSet::new(),
+            to_refresh: BTreeSet::new(),
+            asked: HashSet::new(),
+            progress_at: tokio::time::Instant::now(),
             book_sid: None,
             deferred: Vec::new(),
             last_seq: HashMap::new(),
@@ -293,6 +322,7 @@ impl Connection {
             if let Some(heard) = self.heard.pop_front() {
                 return heard;
             }
+            let stalled_at = self.stalled_at();
             let step = match &mut self.link {
                 Link::Waiting(until) => {
                     tokio::time::sleep_until(*until).await;
@@ -310,6 +340,8 @@ impl Connection {
                         _ = async { tokio::time::sleep_until(refetch_at.expect("guarded")).await },
                             if refetch_at.is_some() => Step::Refetch,
                         read = pump(ws, &mut self.outbox, &mut self.unflushed) => Step::Read(read),
+                        _ = async { tokio::time::sleep_until(stalled_at.expect("guarded")).await },
+                            if stalled_at.is_some() => Step::Stalled,
                         _ = tokio::time::sleep_until(dead_at) => Step::Dead,
                     }
                 }
@@ -332,14 +364,22 @@ impl Connection {
                     if let Err(error) = self.on_message(message) {
                         self.lose(error);
                     }
+                    // A socket that always has something to read never
+                    // reaches the timer above, so look here as well.
+                    self.on_stall();
                 }
                 Step::Read(Some(Err(error))) => self.lose(error.into()),
                 Step::Read(None) => self.lose(anyhow!("websocket closed")),
                 Step::Refetch => {
+                    // Snapshots on their way may be what was missed, so
+                    // those books are asked for again too.
+                    self.asked.clear();
                     let stale = self.take_stale_books();
-                    self.update_books("get_snapshot", stale);
+                    self.to_refresh.extend(stale);
+                    self.release();
                     self.settle();
                 }
+                Step::Stalled => self.on_stall(),
                 Step::Dead => self.lose(anyhow!(
                     "nothing arrived, not even a ping, for {:?}",
                     self.dead_after
@@ -404,6 +444,9 @@ impl Connection {
         self.strikes = 0;
         self.slow_checks = 0;
         self.subscribed.clear();
+        self.to_subscribe.clear();
+        self.to_refresh.clear();
+        self.asked.clear();
         self.book_sid = None;
         self.deferred.clear();
         self.last_seq.clear();
@@ -444,9 +487,7 @@ impl Connection {
         if !self.is_open() {
             return;
         }
-        let mut subscribe = BTreeSet::new();
         let mut unsubscribe = BTreeSet::new();
-        let mut refresh = BTreeSet::new();
         for change in changes {
             match change {
                 SymbolChange::Added(symbol) => {
@@ -458,27 +499,27 @@ impl Connection {
                         // Removed and re-added before we unsubscribed: Kalshi
                         // will not resend a snapshot unless asked.
                         unsubscribe.remove(symbol);
-                        refresh.insert(symbol.clone());
+                        self.to_refresh.insert(symbol.clone());
                     } else {
-                        subscribe.insert(symbol.clone());
+                        self.to_subscribe.insert(symbol.clone());
                     }
                 }
                 SymbolChange::Removed(symbol) => {
                     self.books.remove(symbol);
                     self.catching_up.remove(symbol);
-                    refresh.remove(symbol);
-                    if !subscribe.remove(symbol) && self.subscribed.contains(symbol) {
+                    self.to_refresh.remove(symbol);
+                    self.asked.remove(symbol);
+                    if !self.to_subscribe.remove(symbol) && self.subscribed.contains(symbol) {
                         unsubscribe.insert(symbol.clone());
                     }
                 }
             }
         }
-        self.subscribe_books(subscribe);
         for symbol in &unsubscribe {
             self.subscribed.remove(symbol);
         }
         self.update_books("delete_markets", unsubscribe.into_iter().collect());
-        self.update_books("get_snapshot", refresh.into_iter().collect());
+        self.release();
         self.settle();
     }
 
@@ -492,25 +533,67 @@ impl Connection {
         }
     }
 
-    /// Asks Kalshi for the books of `symbols`. A repeated subscribe adds
-    /// markets to the connection's one orderbook subscription, and each new
-    /// market gets a snapshot.
-    fn subscribe_books(&mut self, symbols: BTreeSet<String>) {
-        let symbols: Vec<String> = symbols.into_iter().collect();
-        for batch in symbols.chunks(COMMAND_BATCH) {
-            let params = json!({
-                "channels": [BOOK_CHANNEL],
-                "market_tickers": batch,
-                // Keep NO levels in NO prices; `Book` converts them to asks.
-                "use_yes_price": false,
-            });
-            self.command("subscribe", params);
+    /// Asks Kalshi for books that are waiting to be asked for, as far as
+    /// [`SNAPSHOT_WINDOW`] allows. Called whenever there may be room: after
+    /// the symbol list changes and after each snapshot that was asked for.
+    ///
+    /// Books to refresh go first: they are already receiving changes that
+    /// cannot be applied until their snapshot arrives.
+    fn release(&mut self) {
+        while self.is_open() && self.asked.len() + COMMAND_BATCH <= SNAPSHOT_WINDOW {
+            let batch = if let (Some(sid), false) = (self.book_sid, self.to_refresh.is_empty()) {
+                let batch = take_first(&mut self.to_refresh, COMMAND_BATCH);
+                let params = json!({ "sids": [sid], "market_tickers": batch, "action": "get_snapshot" });
+                self.command("update_subscription", params);
+                batch
+            } else if !self.to_subscribe.is_empty() {
+                // A repeated subscribe adds markets to the connection's one
+                // orderbook subscription, and each new market gets a snapshot.
+                let batch = take_first(&mut self.to_subscribe, COMMAND_BATCH);
+                let params = json!({
+                    "channels": [BOOK_CHANNEL],
+                    "market_tickers": batch,
+                    // Keep NO levels in NO prices; `Book` converts them to asks.
+                    "use_yes_price": false,
+                    // Without this, each acknowledgement lists the tickers.
+                    "skip_ticker_ack": true,
+                });
+                self.command("subscribe", params);
+                self.subscribed.extend(batch.iter().cloned());
+                batch
+            } else {
+                break;
+            };
+            self.asked.extend(batch);
+            self.progress_at = tokio::time::Instant::now();
         }
-        self.subscribed.extend(symbols);
     }
 
-    /// Sends `delete_markets` or `get_snapshot` for `symbols`, or defers it
-    /// until the orderbook subscription id is known.
+    /// When to stop waiting for the snapshots that were asked for, if more
+    /// books are waiting behind them.
+    fn stalled_at(&self) -> Option<tokio::time::Instant> {
+        let more = !self.to_subscribe.is_empty() || !self.to_refresh.is_empty();
+        (more && !self.asked.is_empty()).then_some(self.progress_at + self.stalled_after)
+    }
+
+    /// Snapshots that were asked for have stopped arriving. A book whose
+    /// snapshot never comes must not hold up all the others, so the wait is
+    /// given up and the next books are asked for.
+    fn on_stall(&mut self) {
+        if self.stalled_at().is_some_and(|at| at <= tokio::time::Instant::now()) {
+            eprintln!(
+                "kalshi[{}]: {} books asked for have sent no snapshot in {:?}; asking for the next ones",
+                self.name,
+                self.asked.len(),
+                self.stalled_after,
+            );
+            self.asked.clear();
+            self.release();
+        }
+    }
+
+    /// Sends `delete_markets` for `symbols`, or defers it until the orderbook
+    /// subscription id is known.
     fn update_books(&mut self, action: &'static str, symbols: Vec<String>) {
         if symbols.is_empty() {
             return;
@@ -531,6 +614,7 @@ impl Connection {
             for (action, symbols) in std::mem::take(&mut self.deferred) {
                 self.update_books(action, symbols);
             }
+            self.release();
         }
     }
 
@@ -589,6 +673,10 @@ impl Connection {
             Body::Unsubscribed => bail!("Kalshi ended subscription {:?}", frame.sid),
             Body::Other { kind, raw } => self.heard.push_back(Heard::Unhandled { kind, raw }),
             Body::BookSnapshot { symbol, snapshot } => {
+                if self.asked.remove(&symbol) {
+                    self.progress_at = tokio::time::Instant::now();
+                    self.release();
+                }
                 if let Some(book) = self.books.get_mut(&symbol) {
                     let mut changes = Vec::new();
                     book.on_snapshot(snapshot, &mut changes)?;
@@ -605,7 +693,8 @@ impl Connection {
                     self.report(&symbol, changes, received_at, exchange_timestamp);
                     if let Err(error) = applied {
                         eprintln!("kalshi[{}]: {symbol}: {error:#}; requesting a snapshot", self.name);
-                        self.update_books("get_snapshot", vec![symbol]);
+                        self.to_refresh.insert(symbol);
+                        self.release();
                     }
                 }
             }
@@ -640,14 +729,15 @@ impl Connection {
 
     /// The symbols whose books need a new snapshot, sorted. A book that
     /// loaded a snapshot after the last gap is already correct and is left
-    /// alone.
+    /// alone, and so is one not subscribed to yet: its snapshot comes when
+    /// it is.
     fn take_stale_books(&mut self) -> Vec<String> {
         self.refetch_at = None;
         self.last_refetch = Some(tokio::time::Instant::now());
         let mut stale: Vec<String> = self
             .books
             .iter()
-            .filter(|(_, book)| !book.is_live())
+            .filter(|(symbol, book)| !book.is_live() && self.subscribed.contains(*symbol))
             .map(|(symbol, _)| symbol.clone())
             .collect();
         stale.sort();
@@ -692,6 +782,15 @@ impl Connection {
     }
 }
 
+/// Removes and returns the first `count` of `symbols`, in order.
+fn take_first(symbols: &mut BTreeSet<String>, count: usize) -> Vec<String> {
+    let batch: Vec<String> = symbols.iter().take(count).cloned().collect();
+    for symbol in &batch {
+        symbols.remove(symbol);
+    }
+    batch
+}
+
 /// Hands queued commands to the socket, and resolves with the next message
 /// read from it (`None` once the stream has ended). Dropping it loses
 /// nothing: a command leaves the queue only when the socket has taken it.
@@ -733,7 +832,7 @@ mod tests {
     use super::*;
 
     fn connection() -> Connection {
-        Connection::new("A".to_owned(), "ws://unused".to_owned(), None, Duration::from_secs(25))
+        Connection::new("A".to_owned(), "ws://unused".to_owned(), None, Duration::from_secs(25), Duration::from_secs(5))
     }
 
     #[test]
@@ -756,6 +855,7 @@ mod tests {
                 .entry(symbol.to_owned())
                 .or_insert_with(|| Synced::new(Book::default()));
             book.on_snapshot(snapshot, &mut Vec::new()).unwrap();
+            connection.subscribed.insert(symbol.to_owned());
         };
         load(&mut connection, "B");
         load(&mut connection, "A");
