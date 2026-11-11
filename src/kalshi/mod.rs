@@ -109,6 +109,11 @@ pub struct KalshiConfig {
     /// `connections` WebSockets, so the total is `groups * connections`.
     /// More groups means less traffic on each socket.
     pub groups: usize,
+    /// The most books one connection may have asked for and still be waiting
+    /// for a snapshot of. It asks for more as snapshots arrive, so this sets
+    /// how hard Kalshi is pushed while books load. 6,000 at once has worked;
+    /// nothing larger has been tried.
+    pub snapshot_window: usize,
     pub health: Health,
     /// How often a status line goes to stderr. `None` for never.
     pub status_interval: Option<Duration>,
@@ -179,6 +184,7 @@ impl KalshiConfig {
             snapshot_interval: Duration::from_secs(60),
             connections: 2,
             groups: 1,
+            snapshot_window: 5_000,
             health: Health::default(),
             status_interval: None,
         }
@@ -189,6 +195,7 @@ impl KalshiConfig {
     ///
     /// * `KALSHI_SERIES_TICKER`: only follow this series.
     /// * `KALSHI_CONNECTIONS` (2) and `KALSHI_GROUPS` (1): see the fields.
+    /// * `KALSHI_SNAPSHOT_WINDOW` (5000): see the field.
     /// * `KALSHI_STATUS_SECONDS` (5): how often to print a status line; 0
     ///   for never.
     /// * `KALSHI_REST_URL` and `KALSHI_WS_URL`: override the environment's.
@@ -216,6 +223,9 @@ impl KalshiConfig {
         }
         if let Some(groups) = number("KALSHI_GROUPS")? {
             config.groups = groups as usize;
+        }
+        if let Some(window) = number("KALSHI_SNAPSHOT_WINDOW")? {
+            config.snapshot_window = window as usize;
         }
         config.status_interval = match number("KALSHI_STATUS_SECONDS")? {
             Some(0) => None,
@@ -329,8 +339,22 @@ impl Kalshi {
 
         anyhow::ensure!(config.connections >= 1, "at least one connection is needed");
         anyhow::ensure!(config.groups >= 1, "at least one group is needed");
+        anyhow::ensure!(
+            config.snapshot_window >= connection::COMMAND_BATCH,
+            "the snapshot window must be at least {}, the size of one command",
+            connection::COMMAND_BATCH
+        );
         let mut connections: Vec<Connection> = (0..config.groups * config.connections)
-            .map(|index| Connection::new(connection_name(index, &config), config.ws_url.clone(), auth.clone(), config.health.dead_after, config.health.stalled_after))
+            .map(|index| {
+                Connection::new(
+                    connection_name(index, &config),
+                    config.ws_url.clone(),
+                    auth.clone(),
+                    config.health.dead_after,
+                    config.health.stalled_after,
+                    config.snapshot_window,
+                )
+            })
             .collect();
         // Each group starts with its first connection as the source.
         let sources: Vec<usize> = (0..config.groups).map(|group| group * config.connections).collect();

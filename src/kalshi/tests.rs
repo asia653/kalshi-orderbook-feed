@@ -438,7 +438,11 @@ async fn many_symbols_are_subscribed_in_batches_in_order() {
 #[tokio::test]
 async fn books_are_asked_for_as_fast_as_snapshots_arrive() {
     let (mut kalshi, _events, rest, websocket) =
-        against_mocks_with(|config| config.health.stalled_after = Duration::from_millis(400)).await;
+        against_mocks_with(|config| {
+            config.health.stalled_after = Duration::from_millis(400);
+            config.snapshot_window = 2_000;
+        })
+        .await;
     let tickers: Vec<String> = (0..3_500).map(|n| format!("M{n:04}")).collect();
     tokio::spawn(serve_markets(rest, tickers.clone()));
     let script = tokio::spawn(async move {

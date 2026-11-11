@@ -37,12 +37,7 @@ use super::wire::{BOOK_CHANNEL, Body, LIFECYCLE_CHANNEL, parse_message};
 use super::{Auth, Event, auth_headers};
 
 /// Symbols per subscribe / update command.
-const COMMAND_BATCH: usize = 500;
-/// The most books that may be asked for and still be waiting for their
-/// snapshot. Asking for every book at once (hundreds of commands, hundreds
-/// of thousands of snapshots owed) made Kalshi reset the connection; 6,000
-/// at once is known to work.
-const SNAPSHOT_WINDOW: usize = 2_000;
+pub(super) const COMMAND_BATCH: usize = 500;
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// The shortest time between two re-fetches of every book. Several sequence
 /// gaps close together are answered with one re-fetch, not one each.
@@ -186,6 +181,9 @@ pub(super) struct Connection {
     /// How long to wait for snapshots that were asked for before asking for
     /// more anyway.
     stalled_after: Duration,
+    /// The most books that may be asked for and still be waiting for their
+    /// snapshot: see [`super::KalshiConfig::snapshot_window`].
+    snapshot_window: usize,
     pub(super) vitals: Vitals,
     /// Health checks in a row that found this connection quiet. Its owner
     /// keeps count here.
@@ -220,7 +218,7 @@ pub(super) struct Connection {
     in_sync: bool,
     /// Symbols Kalshi has been asked to send books for.
     subscribed: HashSet<String>,
-    /// Symbols to subscribe to, not yet asked for: see [`SNAPSHOT_WINDOW`].
+    /// Symbols to subscribe to, not yet asked for: see `snapshot_window`.
     to_subscribe: BTreeSet<String>,
     /// Subscribed symbols whose snapshot is to be asked for again, not yet
     /// asked for.
@@ -250,12 +248,14 @@ impl Connection {
         auth: Option<Arc<Auth>>,
         dead_after: Duration,
         stalled_after: Duration,
+        snapshot_window: usize,
     ) -> Self {
         Self {
             name,
             reporting: false,
             dead_after,
             stalled_after,
+            snapshot_window,
             vitals: Vitals::new(),
             strikes: 0,
             slow_checks: 0,
@@ -534,13 +534,13 @@ impl Connection {
     }
 
     /// Asks Kalshi for books that are waiting to be asked for, as far as
-    /// [`SNAPSHOT_WINDOW`] allows. Called whenever there may be room: after
+    /// `snapshot_window` allows. Called whenever there may be room: after
     /// the symbol list changes and after each snapshot that was asked for.
     ///
     /// Books to refresh go first: they are already receiving changes that
     /// cannot be applied until their snapshot arrives.
     fn release(&mut self) {
-        while self.is_open() && self.asked.len() + COMMAND_BATCH <= SNAPSHOT_WINDOW {
+        while self.is_open() && self.asked.len() + COMMAND_BATCH <= self.snapshot_window {
             let batch = if let (Some(sid), false) = (self.book_sid, self.to_refresh.is_empty()) {
                 let batch = take_first(&mut self.to_refresh, COMMAND_BATCH);
                 let params = json!({ "sids": [sid], "market_tickers": batch, "action": "get_snapshot" });
@@ -832,7 +832,7 @@ mod tests {
     use super::*;
 
     fn connection() -> Connection {
-        Connection::new("A".to_owned(), "ws://unused".to_owned(), None, Duration::from_secs(25), Duration::from_secs(5))
+        Connection::new("A".to_owned(), "ws://unused".to_owned(), None, Duration::from_secs(25), Duration::from_secs(5), 2_000)
     }
 
     #[test]
